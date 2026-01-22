@@ -1,0 +1,22 @@
+training:
+  backbone_name: efficientnet_b4
+  input_size: 448
+  pretrained: true
+  batch_size: 32
+  epochs: 20
+  learning_rate: 0.0001
+  weight_decay: 0.00001
+  eta_init: 0.8
+  eta_learnable: true
+  train_split: 0.8
+  num_workers: 4
+  checkpoint_dir: results
+  save_every: 5
+  log_interval: 10
+  device: cuda
+
+data:
+  bu`ket_name: surface-quality-dataset
+  data_prefix: quack_v2_data_user_logs/
+  local_data_dir: /home/hitul/Desktop/quality-comparison-toolkit/data
+  image_dir: /home/hitul/Desktop/quality-comparison-toolkit/data/iter_0

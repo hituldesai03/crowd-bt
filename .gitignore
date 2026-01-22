@@ -1,0 +1,16 @@
+.claude
+.quality
+holdout_visualizations_calibrated
+model_output_golden*
+results*
+training_data*
+gold_ranking_patches.txt
+Golden_report.html
+Holdout_report_large.html
+*.html
+*.pkl
+*.ckpt
+*.pt
+*.bin
+*.log
+__pycache__/
