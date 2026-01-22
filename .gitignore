@@ -14,3 +14,7 @@ Holdout_report_large.html
 *.bin
 *.log
 __pycache__/
+data/
+golden_images*
+*.json
+golden_ranking_images_ranked/
