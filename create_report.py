@@ -2,7 +2,7 @@ import json
 import os
 
 # --- Configuration ---
-data_path = "model_output_golden_ranking/scores_calibrated.json"
+data_path = "golden_ranking_images_ranked/scores_calibrated.json"
 output_filename = "Golden_report.html"
 # ---------------------
 

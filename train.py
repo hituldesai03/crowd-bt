@@ -119,6 +119,22 @@ def validate(
     }
 
 
+def find_latest_checkpoint(checkpoint_dir: str) -> Optional[str]:
+    """
+    Find the latest checkpoint in the checkpoint directory.
+
+    Args:
+        checkpoint_dir: Directory to search for checkpoints
+
+    Returns:
+        Path to the latest checkpoint (last.pt), or None if not found
+    """
+    last_checkpoint = os.path.join(checkpoint_dir, 'last.pt')
+    if os.path.exists(last_checkpoint):
+        return last_checkpoint
+    return None
+
+
 def save_checkpoint(
     model: nn.Module,
     optimizer,
@@ -127,7 +143,8 @@ def save_checkpoint(
     epoch: int,
     metrics: Dict,
     path: str,
-    config: Config
+    config: Config,
+    is_best: bool = False
 ):
     """Save a training checkpoint."""
     checkpoint = {
@@ -147,13 +164,18 @@ def save_checkpoint(
         checkpoint['eta_logit'] = criterion.eta_logit.data.item()
 
     torch.save(checkpoint, path)
-    print(f"Saved checkpoint to {path}")
+
+    if is_best:
+        print(f"Saved best checkpoint to {path}")
+    else:
+        print(f"Saved checkpoint to {path}")
 
 
 def train(
     config: Config = None,
     data_source: str = "local",
-    checkpoint_path: Optional[str] = None
+    checkpoint_path: Optional[str] = None,
+    auto_resume: bool = True
 ):
     """
     Main training function.
@@ -161,7 +183,9 @@ def train(
     Args:
         config: Training configuration
         data_source: 'local' or 's3'
-        checkpoint_path: Optional path to resume from
+        checkpoint_path: Optional path to resume from. If None and auto_resume is True,
+                        will automatically resume from last.pt if it exists
+        auto_resume: Whether to automatically resume from last.pt if checkpoint_path is None
     """
     if config is None:
         config = default_config
@@ -260,12 +284,23 @@ def train(
         eta_min=config.training.learning_rate * 0.01
     )
 
-    # Resume from checkpoint if provided
+    # Resume from checkpoint
     start_epoch = 0
     best_val_acc = 0.0
 
+    # Auto-resume: if no checkpoint_path provided and auto_resume enabled, look for last.pt
+    if checkpoint_path is None and auto_resume:
+        checkpoint_path = find_latest_checkpoint(config.training.checkpoint_dir)
+        if checkpoint_path:
+            print(f"\nFound existing checkpoint: {checkpoint_path}")
+            print("Auto-resuming training (use --no-auto-resume to disable)")
+        else:
+            print("\nNo checkpoint found, starting training from scratch")
+    elif checkpoint_path is None:
+        print("\nStarting training from scratch (auto-resume disabled)")
+
     if checkpoint_path and os.path.exists(checkpoint_path):
-        print(f"\nResuming from {checkpoint_path}")
+        print(f"Resuming from {checkpoint_path}")
         checkpoint = torch.load(checkpoint_path, map_location=device)
         model.load_state_dict(checkpoint['model'])
         optimizer.load_state_dict(checkpoint['optimizer'])
@@ -275,7 +310,7 @@ def train(
         best_val_acc = checkpoint['metrics'].get('val_accuracy', 0.0)
         if 'eta_logit' in checkpoint:
             criterion.eta_logit.data = torch.tensor(checkpoint['eta_logit'])
-        print(f"Resumed from epoch {start_epoch}")
+        print(f"Resumed from epoch {start_epoch} with best val acc: {best_val_acc:.3f}")
 
     # Create checkpoint directory
     os.makedirs(config.training.checkpoint_dir, exist_ok=True)
@@ -328,9 +363,17 @@ def train(
             save_checkpoint(
                 model, optimizer, scheduler, criterion,
                 epoch, {'val_accuracy': val_metrics['accuracy'], **val_metrics},
-                best_path, config
+                best_path, config, is_best=True
             )
             print(f"New best model! Val Acc: {best_val_acc:.3f}")
+
+        # Save latest checkpoint after every epoch for auto-resume
+        last_path = os.path.join(config.training.checkpoint_dir, 'last.pt')
+        save_checkpoint(
+            model, optimizer, scheduler, criterion,
+            epoch, {'val_accuracy': val_metrics['accuracy'], **val_metrics},
+            last_path, config, is_best=False
+        )
 
         # Save periodic checkpoint
         if (epoch + 1) % config.training.save_every == 0:
@@ -341,7 +384,7 @@ def train(
             save_checkpoint(
                 model, optimizer, scheduler, criterion,
                 epoch, {'val_accuracy': val_metrics['accuracy'], **val_metrics},
-                ckpt_path, config
+                ckpt_path, config, is_best=False
             )
 
         # Save training log
@@ -464,7 +507,9 @@ def main():
     parser.add_argument('--checkpoint-dir', type=str, default='results',
                         help='Directory to save checkpoints')
     parser.add_argument('--resume', type=str, default=None,
-                        help='Resume from checkpoint')
+                        help='Resume from specific checkpoint path')
+    parser.add_argument('--no-auto-resume', action='store_true',
+                        help='Disable automatic resume from last.pt')
     parser.add_argument('--device', type=str, default='cuda',
                         help='Device (cuda or cpu)')
     parser.add_argument('--num-workers', type=int, default=4,
@@ -505,7 +550,12 @@ def main():
     print(f"Config saved to {config_path}")
 
     # Train
-    train(config, data_source=args.data_source, checkpoint_path=args.resume)
+    train(
+        config,
+        data_source=args.data_source,
+        checkpoint_path=args.resume,
+        auto_resume=not args.no_auto_resume
+    )
 
 
 if __name__ == '__main__':
