@@ -4,8 +4,8 @@ Prepare training data from S3 user comparisons.
 This script:
 1. Fetches all user comparison data from S3
 2. Computes user reliability scores
-3. Aggregates comparisons across users
-4. Prepares training data with proper labels and weights
+3. Keeps each annotation as individual sample (no aggregation) - correct Crowd-BT approach
+4. Each annotation includes user's reliability as fixed eta
 5. Creates train/test split
 6. Saves the prepared data locally
 """
@@ -18,7 +18,8 @@ from datetime import datetime
 from config import default_config
 from data_loader import (
     load_all_comparisons,
-    prepare_training_data
+    prepare_training_data,
+    prepare_training_data_individual
 )
 from dataset import split_comparisons
 
@@ -33,17 +34,22 @@ def main():
                         default='quack_v2_data_user_logs/',
                         help='S3 data prefix')
     parser.add_argument('--min-reliability', type=float, default=0.3,
-                        help='Minimum user reliability score')
+                        help='Minimum user reliability score to include user')
+    parser.add_argument('--min-annotation-reliability', type=float, default=0.5,
+                        help='Minimum reliability for individual annotations (used with --individual)')
     parser.add_argument('--vote-threshold', type=float, default=0.6,
-                        help='Vote threshold for aggregated labels')
+                        help='Vote threshold for aggregated labels (used with --aggregate)')
     parser.add_argument('--train-split', type=float, default=0.8,
                         help='Train/validation split ratio')
     parser.add_argument('--exclude-dummy', action='store_true', default=True,
                         help='Exclude dummy users')
     parser.add_argument('--output-dir', type=str, default='training_data',
                         help='Output directory for prepared data')
+    parser.add_argument('--aggregate', action='store_true',
+                        help='Use aggregated mode (default is individual annotations)')
 
     args = parser.parse_args()
+    use_individual = not args.aggregate
 
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
@@ -53,8 +59,12 @@ def main():
     print("="*60)
     print(f"Bucket: {args.bucket}")
     print(f"Prefix: {args.prefix}")
-    print(f"Min Reliability: {args.min_reliability}")
-    print(f"Vote Threshold: {args.vote_threshold}")
+    print(f"Min User Reliability: {args.min_reliability}")
+    print(f"Mode: {'Individual annotations (Crowd-BT)' if use_individual else 'Aggregated'}")
+    if use_individual:
+        print(f"Min Annotation Reliability: {args.min_annotation_reliability}")
+    else:
+        print(f"Vote Threshold: {args.vote_threshold}")
     print(f"Exclude Dummy: {args.exclude_dummy}")
     print()
 
@@ -85,16 +95,28 @@ def main():
         json.dump(user_reliabilities, f, indent=2)
     print(f"Saved user reliabilities to {reliability_path}")
 
-    # Prepare training data (aggregates votes, computes labels and weights)
+    # Prepare training data
     print("\n" + "="*60)
     print("Preparing Training Data")
     print("="*60)
 
-    training_data = prepare_training_data(
-        all_comparisons,
-        use_gold_labels=True,
-        vote_threshold=args.vote_threshold
-    )
+    if use_individual:
+        # Keep each annotation separate with user reliability as fixed eta
+        # This is the correct Crowd-BT approach
+        print("Using individual annotations (each annotation is a training sample)")
+        print("Each annotation's eta = annotator's reliability score")
+        training_data = prepare_training_data_individual(
+            all_comparisons,
+            min_reliability=args.min_annotation_reliability
+        )
+    else:
+        # Aggregate votes across users (legacy mode)
+        print("Using aggregated mode (votes combined into single label)")
+        training_data = prepare_training_data(
+            all_comparisons,
+            use_gold_labels=True,
+            vote_threshold=args.vote_threshold
+        )
 
     # Print data statistics
     print("\nData Statistics:")
@@ -154,8 +176,10 @@ def main():
         'created_at': datetime.now().isoformat(),
         'bucket_name': args.bucket,
         'data_prefix': args.prefix,
-        'min_reliability': args.min_reliability,
-        'vote_threshold': args.vote_threshold,
+        'mode': 'individual' if use_individual else 'aggregated',
+        'min_user_reliability': args.min_reliability,
+        'min_annotation_reliability': args.min_annotation_reliability if use_individual else None,
+        'vote_threshold': args.vote_threshold if not use_individual else None,
         'train_split': args.train_split,
         'exclude_dummy': args.exclude_dummy,
         'num_users': len(user_reliabilities),
@@ -165,6 +189,7 @@ def main():
         'val_samples': len(val_data),
         'pair_type_distribution': pair_types,
         'label_distribution': label_counts,
+        'uses_fixed_eta': use_individual,  # Each annotation's reliability is used as fixed eta
     }
 
     metadata_path = os.path.join(args.output_dir, 'metadata.json')

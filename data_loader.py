@@ -388,3 +388,84 @@ def prepare_training_data(
 
     print(f"Prepared {len(training_data)} training samples")
     return training_data
+
+
+def prepare_training_data_individual(
+    comparisons: List[Dict],
+    min_reliability: float = 0.5
+) -> List[Dict]:
+    """
+    Prepare training data WITHOUT aggregation - each annotation is a separate sample.
+
+    This is the correct approach for Crowd-BT: each annotation from each user
+    is kept as a distinct training sample, with the user's reliability used
+    as their fixed eta value.
+
+    Args:
+        comparisons: List of comparison dicts (with annotator_id and annotator_reliability)
+        min_reliability: Minimum reliability to include an annotation
+
+    Returns:
+        List of training samples, each with:
+        - 'img1', 'img2': image filenames
+        - 'label': 1 (left wins), -1 (right wins), 0 (draw)
+        - 'weight': sample weight (1.0 for all individual annotations)
+        - 'annotator_id': user who made this annotation
+        - 'annotator_reliability': user's reliability score (used as fixed eta)
+        - 'pair_type': type of comparison pair
+    """
+    training_data = []
+    skipped_low_reliability = 0
+    skipped_missing_data = 0
+
+    for comp in comparisons:
+        img1 = comp.get('img1')
+        img2 = comp.get('img2')
+        choice = comp.get('choice')
+        annotator_id = comp.get('annotator_id', 'unknown')
+        reliability = comp.get('annotator_reliability', 0.5)
+
+        # Skip if missing essential data
+        if not img1 or not img2 or not choice:
+            skipped_missing_data += 1
+            continue
+
+        # Skip low reliability annotations
+        if reliability < min_reliability:
+            skipped_low_reliability += 1
+            continue
+
+        # Convert choice to label
+        if choice == 'left':
+            label = 1  # img1 > img2
+        elif choice == 'right':
+            label = -1  # img1 < img2
+        elif choice == 'draw':
+            label = 0
+        else:
+            skipped_missing_data += 1
+            continue
+
+        training_data.append({
+            'img1': img1,
+            'img2': img2,
+            'label': label,
+            'weight': 1.0,  # All individual annotations have equal weight
+            'annotator_id': annotator_id,
+            'annotator_reliability': reliability,  # This will be used as fixed eta
+            'pair_type': comp.get('pair_type', 'unknown'),
+            'img1_category': comp.get('img1_category', ''),
+            'img2_category': comp.get('img2_category', ''),
+        })
+
+    print(f"Prepared {len(training_data)} individual training samples")
+    print(f"  Skipped {skipped_low_reliability} low-reliability annotations")
+    print(f"  Skipped {skipped_missing_data} annotations with missing data")
+
+    # Print reliability distribution
+    if training_data:
+        reliabilities = [d['annotator_reliability'] for d in training_data]
+        print(f"  Reliability range: [{min(reliabilities):.3f}, {max(reliabilities):.3f}]")
+        print(f"  Mean reliability: {sum(reliabilities)/len(reliabilities):.3f}")
+
+    return training_data

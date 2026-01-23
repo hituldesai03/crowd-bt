@@ -57,6 +57,8 @@ class PairwiseComparisonDataset(Dataset):
     - img2: Second image tensor
     - label: 1 if img1 > img2, -1 if img1 < img2, 0 if draw
     - weight: Confidence weight for this comparison
+    - annotator_id: ID of the annotator who made this comparison
+    - annotator_reliability: Reliability score of the annotator (used as fixed eta)
     """
 
     def __init__(
@@ -126,8 +128,14 @@ class PairwiseComparisonDataset(Dataset):
         # Weight for this comparison
         weight = torch.tensor(comp.get('weight', 1.0), dtype=torch.float32)
 
-        # Annotator ID for per-user eta (if available)
+        # Annotator info for per-user fixed eta
         annotator_id = comp.get('annotator_id', 'unknown')
+        # Reliability is used directly as fixed eta in the loss function
+        # Default to 0.8 if not available (will be clamped to [0.5, 1.0] in loss)
+        annotator_reliability = torch.tensor(
+            comp.get('annotator_reliability', 0.8),
+            dtype=torch.float32
+        )
 
         return {
             'img1': img1,
@@ -135,6 +143,7 @@ class PairwiseComparisonDataset(Dataset):
             'label': label,
             'weight': weight,
             'annotator_id': annotator_id,
+            'annotator_reliability': annotator_reliability,
         }
 
 

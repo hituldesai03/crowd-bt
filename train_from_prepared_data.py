@@ -58,13 +58,18 @@ def main():
 
     # Load metadata to show what we're training on
     metadata_path = os.path.join(args.data_dir, 'metadata.json')
+    metadata = {}
+    uses_fixed_eta = False
     if os.path.exists(metadata_path):
         with open(metadata_path, 'r') as f:
             metadata = json.load(f)
+        uses_fixed_eta = metadata.get('uses_fixed_eta', False)
         print("="*60)
         print("Training Data Info")
         print("="*60)
         print(f"Data prepared: {metadata.get('created_at', 'unknown')}")
+        print(f"Mode: {metadata.get('mode', 'unknown')}")
+        print(f"Uses fixed eta: {uses_fixed_eta}")
         print(f"Number of users: {metadata.get('num_users', 'unknown')}")
         print(f"Avg user reliability: {metadata.get('avg_user_reliability', 0):.3f}")
         print(f"Total samples: {metadata.get('total_samples', 0)}")
@@ -159,15 +164,24 @@ def main():
     model = model.to(device)
 
     # Create loss function
-    criterion = CrowdBTLoss(
-        eta_init=config.training.eta_init,
-        eta_learnable=config.training.eta_learnable
-    )
+    # If using fixed eta (individual annotations), eta is not learnable
+    if uses_fixed_eta:
+        print("Using per-annotation reliability as fixed eta (correct Crowd-BT)")
+        criterion = CrowdBTLoss(
+            eta_init=config.training.eta_init,
+            eta_learnable=False  # Eta passed per-annotation at runtime
+        )
+    else:
+        print(f"Using global {'learnable' if config.training.eta_learnable else 'fixed'} eta")
+        criterion = CrowdBTLoss(
+            eta_init=config.training.eta_init,
+            eta_learnable=config.training.eta_learnable
+        )
     criterion = criterion.to(device)
 
-    # Optimizer
+    # Optimizer - only include eta if learnable and not using fixed eta
     params = list(model.parameters())
-    if config.training.eta_learnable:
+    if config.training.eta_learnable and not uses_fixed_eta:
         params.append(criterion.eta_logit)
 
     optimizer = AdamW(

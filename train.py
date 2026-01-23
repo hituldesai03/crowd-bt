@@ -24,7 +24,8 @@ from dataset import (
 from data_loader import (
     load_all_comparisons,
     load_local_comparisons,
-    prepare_training_data
+    prepare_training_data,
+    prepare_training_data_individual
 )
 from evaluate import full_evaluation, print_evaluation_report
 
@@ -50,7 +51,10 @@ def train_epoch(
         img2 = batch['img2'].to(device)
         labels = batch['label'].to(device)
         weights = batch['weight'].to(device)
-        annotator_ids = batch.get('annotator_id', None)
+        # Get per-annotation reliability as fixed eta
+        annotator_reliabilities = batch.get('annotator_reliability')
+        if annotator_reliabilities is not None:
+            annotator_reliabilities = annotator_reliabilities.to(device)
 
         optimizer.zero_grad()
 
@@ -59,8 +63,8 @@ def train_epoch(
         score2 = model(img2)
         score_diff = score1 - score2
 
-        # Compute loss (pass annotator_ids for per-user eta)
-        loss_dict = criterion(score_diff, labels, weights, annotator_ids)
+        # Compute loss (pass annotator_reliabilities as fixed eta values)
+        loss_dict = criterion(score_diff, labels, weights, annotator_reliabilities)
         loss = loss_dict['loss']
 
         # Backward pass
@@ -103,13 +107,16 @@ def validate(
         img2 = batch['img2'].to(device)
         labels = batch['label'].to(device)
         weights = batch['weight'].to(device)
-        annotator_ids = batch.get('annotator_id', None)
+        # Get per-annotation reliability as fixed eta
+        annotator_reliabilities = batch.get('annotator_reliability')
+        if annotator_reliabilities is not None:
+            annotator_reliabilities = annotator_reliabilities.to(device)
 
         score1 = model(img1)
         score2 = model(img2)
         score_diff = score1 - score2
 
-        loss_dict = criterion(score_diff, labels, weights, annotator_ids)
+        loss_dict = criterion(score_diff, labels, weights, annotator_reliabilities)
 
         total_loss += loss_dict['loss'].item()
         total_acc += loss_dict['accuracy'].item()
@@ -161,29 +168,10 @@ def save_checkpoint(
         }
     }
 
-    # Save eta parameters if using Crowd-BT loss
-    if hasattr(criterion, 'use_per_user_eta') and criterion.use_per_user_eta:
-        # Save per-user eta parameters
-        user_eta_dict = {}
-        if criterion.eta_learnable:
-            for user_id, param in criterion.user_eta_logits.items():
-                user_eta_dict[user_id] = param.data.item()
-            checkpoint['user_eta_logits'] = user_eta_dict
-            checkpoint['default_eta_logit'] = criterion.default_eta_logit.data.item()
-        else:
-            # Non-learnable etas (stored as buffers)
-            for name, buffer in criterion.named_buffers():
-                if name.startswith('eta_logit_'):
-                    user_id = name[len('eta_logit_'):]
-                    user_eta_dict[user_id] = buffer.item()
-            checkpoint['user_eta_logits'] = user_eta_dict
-            if hasattr(criterion, 'default_eta_logit'):
-                checkpoint['default_eta_logit'] = criterion.default_eta_logit.item()
-        checkpoint['use_per_user_eta'] = True
-    elif hasattr(criterion, 'eta_logit'):
-        # Save single global eta
+    # Save global eta parameter if using Crowd-BT loss
+    # Note: Per-annotation fixed eta is passed at runtime, not stored in model
+    if hasattr(criterion, 'eta_logit'):
         checkpoint['eta_logit'] = criterion.eta_logit.data.item()
-        checkpoint['use_per_user_eta'] = False
 
     torch.save(checkpoint, path)
 
@@ -223,20 +211,33 @@ def train(
 
     # Load comparison data
     print("\nLoading comparison data...")
-    user_reliabilities = None  # Will be populated if loading from S3
+    use_fixed_eta = False  # Will be set to True if using per-annotation reliability
+
     if data_source == "s3":
+        # Load all comparisons with per-user reliability scores
         comparisons, user_reliabilities = load_all_comparisons(
             bucket_name=config.data.bucket_name,
             data_prefix=config.data.data_prefix,
             min_reliability=0.3,
             exclude_dummy=True
         )
-        training_data = prepare_training_data(comparisons, use_gold_labels=True)
+
+        # Use individual annotations (no aggregation) with per-annotation fixed eta
+        # This is the correct Crowd-BT approach
+        training_data = prepare_training_data_individual(
+            comparisons,
+            min_reliability=0.5  # Each annotation's reliability used as fixed eta
+        )
+        use_fixed_eta = True
+
+        print(f"\nUsing per-annotation fixed eta from {len(user_reliabilities)} users")
+        print(f"User reliability range: [{min(user_reliabilities.values()):.3f}, "
+              f"{max(user_reliabilities.values()):.3f}]")
     else:
-        # Load from local files
+        # Load from local files (no per-user reliability available)
         local_comparisons = load_local_comparisons(data_dir=config.data.local_data_dir)
 
-        # Convert to training format
+        # Convert to training format (will use global eta)
         training_data = []
         for comp in local_comparisons:
             label = 0
@@ -253,6 +254,7 @@ def train(
                 'weight': 1.0,
                 'pair_type': comp.get('type', 'unknown'),
             })
+        print("\nUsing global eta (no per-annotation reliability available)")
 
     print(f"Total training samples: {len(training_data)}")
 
@@ -282,33 +284,26 @@ def train(
     )
     model = model.to(device)
 
-    # Create loss function with per-user eta initialization
+    # Create loss function
+    # When use_fixed_eta=True, per-annotation reliability is passed at forward() time
+    # The global eta is only used as fallback when reliability not provided
     criterion = CrowdBTLoss(
         eta_init=config.training.eta_init,
-        eta_learnable=config.training.eta_learnable,
-        user_reliabilities=user_reliabilities  # Per-user eta if available
+        eta_learnable=config.training.eta_learnable and not use_fixed_eta
     )
     criterion = criterion.to(device)
 
-    # Print eta initialization info
-    if criterion.use_per_user_eta:
-        print(f"\nInitialized per-user eta for {len(user_reliabilities)} users")
-        print(f"Per-user eta values: min={min(user_reliabilities.values()):.3f}, "
-              f"max={max(user_reliabilities.values()):.3f}, "
-              f"mean={sum(user_reliabilities.values())/len(user_reliabilities):.3f}")
+    if use_fixed_eta:
+        print("Loss uses per-annotation reliability as fixed eta (no learning)")
     else:
-        print(f"\nUsing global eta initialized to {config.training.eta_init:.3f}")
+        print(f"Loss uses global eta initialized to {config.training.eta_init:.3f}")
+        if config.training.eta_learnable:
+            print("Global eta is learnable")
 
-    # Optimizer - include all eta parameters if learnable
+    # Optimizer - only include global eta if learnable and not using fixed eta
     params = list(model.parameters())
-    if config.training.eta_learnable:
-        if criterion.use_per_user_eta:
-            # Add all per-user eta parameters
-            params.extend(criterion.user_eta_logits.parameters())
-            params.append(criterion.default_eta_logit)
-        else:
-            # Add single global eta parameter
-            params.append(criterion.eta_logit)
+    if config.training.eta_learnable and not use_fixed_eta:
+        params.append(criterion.eta_logit)
 
     optimizer = AdamW(
         params,
@@ -348,22 +343,9 @@ def train(
         start_epoch = checkpoint['epoch'] + 1
         best_val_acc = checkpoint['metrics'].get('val_accuracy', 0.0)
 
-        # Load eta parameters
-        if checkpoint.get('use_per_user_eta', False):
-            # Load per-user eta parameters
-            if 'user_eta_logits' in checkpoint:
-                for user_id, eta_value in checkpoint['user_eta_logits'].items():
-                    if criterion.eta_learnable and user_id in criterion.user_eta_logits:
-                        criterion.user_eta_logits[user_id].data = torch.tensor(eta_value)
-                    elif hasattr(criterion, f'eta_logit_{user_id}'):
-                        getattr(criterion, f'eta_logit_{user_id}').data = torch.tensor(eta_value)
-            if 'default_eta_logit' in checkpoint:
-                criterion.default_eta_logit.data = torch.tensor(checkpoint['default_eta_logit'])
-            print(f"Loaded per-user eta parameters for {len(checkpoint.get('user_eta_logits', {}))} users")
-        elif 'eta_logit' in checkpoint:
-            # Load single global eta (backward compatible)
-            if hasattr(criterion, 'eta_logit'):
-                criterion.eta_logit.data = torch.tensor(checkpoint['eta_logit'])
+        # Load global eta parameter if present (backward compatible)
+        if 'eta_logit' in checkpoint and hasattr(criterion, 'eta_logit'):
+            criterion.eta_logit.data = torch.tensor(checkpoint['eta_logit'])
 
         print(f"Resumed from epoch {start_epoch} with best val acc: {best_val_acc:.3f}")
 
