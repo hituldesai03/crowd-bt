@@ -50,6 +50,7 @@ def train_epoch(
         img2 = batch['img2'].to(device)
         labels = batch['label'].to(device)
         weights = batch['weight'].to(device)
+        annotator_ids = batch.get('annotator_id', None)
 
         optimizer.zero_grad()
 
@@ -58,8 +59,8 @@ def train_epoch(
         score2 = model(img2)
         score_diff = score1 - score2
 
-        # Compute loss
-        loss_dict = criterion(score_diff, labels, weights)
+        # Compute loss (pass annotator_ids for per-user eta)
+        loss_dict = criterion(score_diff, labels, weights, annotator_ids)
         loss = loss_dict['loss']
 
         # Backward pass
@@ -102,12 +103,13 @@ def validate(
         img2 = batch['img2'].to(device)
         labels = batch['label'].to(device)
         weights = batch['weight'].to(device)
+        annotator_ids = batch.get('annotator_id', None)
 
         score1 = model(img1)
         score2 = model(img2)
         score_diff = score1 - score2
 
-        loss_dict = criterion(score_diff, labels, weights)
+        loss_dict = criterion(score_diff, labels, weights, annotator_ids)
 
         total_loss += loss_dict['loss'].item()
         total_acc += loss_dict['accuracy'].item()
@@ -159,9 +161,29 @@ def save_checkpoint(
         }
     }
 
-    # Save eta if using Crowd-BT loss
-    if hasattr(criterion, 'eta_logit'):
+    # Save eta parameters if using Crowd-BT loss
+    if hasattr(criterion, 'use_per_user_eta') and criterion.use_per_user_eta:
+        # Save per-user eta parameters
+        user_eta_dict = {}
+        if criterion.eta_learnable:
+            for user_id, param in criterion.user_eta_logits.items():
+                user_eta_dict[user_id] = param.data.item()
+            checkpoint['user_eta_logits'] = user_eta_dict
+            checkpoint['default_eta_logit'] = criterion.default_eta_logit.data.item()
+        else:
+            # Non-learnable etas (stored as buffers)
+            for name, buffer in criterion.named_buffers():
+                if name.startswith('eta_logit_'):
+                    user_id = name[len('eta_logit_'):]
+                    user_eta_dict[user_id] = buffer.item()
+            checkpoint['user_eta_logits'] = user_eta_dict
+            if hasattr(criterion, 'default_eta_logit'):
+                checkpoint['default_eta_logit'] = criterion.default_eta_logit.item()
+        checkpoint['use_per_user_eta'] = True
+    elif hasattr(criterion, 'eta_logit'):
+        # Save single global eta
         checkpoint['eta_logit'] = criterion.eta_logit.data.item()
+        checkpoint['use_per_user_eta'] = False
 
     torch.save(checkpoint, path)
 
@@ -201,6 +223,7 @@ def train(
 
     # Load comparison data
     print("\nLoading comparison data...")
+    user_reliabilities = None  # Will be populated if loading from S3
     if data_source == "s3":
         comparisons, user_reliabilities = load_all_comparisons(
             bucket_name=config.data.bucket_name,
@@ -259,17 +282,33 @@ def train(
     )
     model = model.to(device)
 
-    # Create loss function
+    # Create loss function with per-user eta initialization
     criterion = CrowdBTLoss(
         eta_init=config.training.eta_init,
-        eta_learnable=config.training.eta_learnable
+        eta_learnable=config.training.eta_learnable,
+        user_reliabilities=user_reliabilities  # Per-user eta if available
     )
     criterion = criterion.to(device)
 
-    # Optimizer - include eta parameter if learnable
+    # Print eta initialization info
+    if criterion.use_per_user_eta:
+        print(f"\nInitialized per-user eta for {len(user_reliabilities)} users")
+        print(f"Per-user eta values: min={min(user_reliabilities.values()):.3f}, "
+              f"max={max(user_reliabilities.values()):.3f}, "
+              f"mean={sum(user_reliabilities.values())/len(user_reliabilities):.3f}")
+    else:
+        print(f"\nUsing global eta initialized to {config.training.eta_init:.3f}")
+
+    # Optimizer - include all eta parameters if learnable
     params = list(model.parameters())
     if config.training.eta_learnable:
-        params.append(criterion.eta_logit)
+        if criterion.use_per_user_eta:
+            # Add all per-user eta parameters
+            params.extend(criterion.user_eta_logits.parameters())
+            params.append(criterion.default_eta_logit)
+        else:
+            # Add single global eta parameter
+            params.append(criterion.eta_logit)
 
     optimizer = AdamW(
         params,
@@ -308,8 +347,24 @@ def train(
             scheduler.load_state_dict(checkpoint['scheduler'])
         start_epoch = checkpoint['epoch'] + 1
         best_val_acc = checkpoint['metrics'].get('val_accuracy', 0.0)
-        if 'eta_logit' in checkpoint:
-            criterion.eta_logit.data = torch.tensor(checkpoint['eta_logit'])
+
+        # Load eta parameters
+        if checkpoint.get('use_per_user_eta', False):
+            # Load per-user eta parameters
+            if 'user_eta_logits' in checkpoint:
+                for user_id, eta_value in checkpoint['user_eta_logits'].items():
+                    if criterion.eta_learnable and user_id in criterion.user_eta_logits:
+                        criterion.user_eta_logits[user_id].data = torch.tensor(eta_value)
+                    elif hasattr(criterion, f'eta_logit_{user_id}'):
+                        getattr(criterion, f'eta_logit_{user_id}').data = torch.tensor(eta_value)
+            if 'default_eta_logit' in checkpoint:
+                criterion.default_eta_logit.data = torch.tensor(checkpoint['default_eta_logit'])
+            print(f"Loaded per-user eta parameters for {len(checkpoint.get('user_eta_logits', {}))} users")
+        elif 'eta_logit' in checkpoint:
+            # Load single global eta (backward compatible)
+            if hasattr(criterion, 'eta_logit'):
+                criterion.eta_logit.data = torch.tensor(checkpoint['eta_logit'])
+
         print(f"Resumed from epoch {start_epoch} with best val acc: {best_val_acc:.3f}")
 
     # Create checkpoint directory

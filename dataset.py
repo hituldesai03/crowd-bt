@@ -126,11 +126,15 @@ class PairwiseComparisonDataset(Dataset):
         # Weight for this comparison
         weight = torch.tensor(comp.get('weight', 1.0), dtype=torch.float32)
 
+        # Annotator ID for per-user eta (if available)
+        annotator_id = comp.get('annotator_id', 'unknown')
+
         return {
             'img1': img1,
             'img2': img2,
             'label': label,
             'weight': weight,
+            'annotator_id': annotator_id,
         }
 
 

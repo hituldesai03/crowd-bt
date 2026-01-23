@@ -10,7 +10,7 @@ The Crowd-BT model extends Bradley-Terry to handle:
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict, Optional
+from typing import Dict, Optional, List
 
 
 class CrowdBTLoss(nn.Module):
@@ -27,6 +27,8 @@ class CrowdBTLoss(nn.Module):
 
     where eta in [0.5, 1] represents annotator reliability.
     eta = 1.0 means perfect annotator, eta = 0.5 means random guessing.
+
+    Supports per-user eta parameters initialized from user reliabilities.
     """
 
     def __init__(
@@ -34,29 +36,52 @@ class CrowdBTLoss(nn.Module):
         eta_init: float = 0.8,
         eta_learnable: bool = True,
         margin: float = 0.0,
-        draw_margin: float = 0.1
+        draw_margin: float = 0.1,
+        user_reliabilities: Optional[Dict[str, float]] = None
     ):
         """
         Args:
-            eta_init: Initial annotator reliability (0.5 to 1.0)
+            eta_init: Default initial annotator reliability (0.5 to 1.0)
             eta_learnable: Whether eta is a learnable parameter
             margin: Minimum margin for clear wins (optional)
             draw_margin: Score difference threshold for draws
+            user_reliabilities: Dict mapping user_id -> reliability score (0.5 to 1.0)
+                If provided, creates per-user eta parameters initialized from reliabilities
         """
         super().__init__()
 
-        # Annotator reliability parameter
-        # Use sigmoid to constrain eta to [0.5, 1.0]
-        # eta = 0.5 + 0.5 * sigmoid(eta_logit)
-        eta_logit = self._eta_to_logit(eta_init)
-
-        if eta_learnable:
-            self.eta_logit = nn.Parameter(torch.tensor(eta_logit))
-        else:
-            self.register_buffer('eta_logit', torch.tensor(eta_logit))
-
+        self.eta_learnable = eta_learnable
         self.margin = margin
         self.draw_margin = draw_margin
+
+        # Per-user eta parameters
+        if user_reliabilities is not None and len(user_reliabilities) > 0:
+            # Use per-user etas initialized from computed reliabilities
+            self.use_per_user_eta = True
+            self.user_eta_logits = nn.ParameterDict() if eta_learnable else {}
+
+            for user_id, reliability in user_reliabilities.items():
+                eta_logit = self._eta_to_logit(reliability)
+                if eta_learnable:
+                    self.user_eta_logits[user_id] = nn.Parameter(torch.tensor(eta_logit))
+                else:
+                    self.register_buffer(f'eta_logit_{user_id}', torch.tensor(eta_logit))
+
+            # Default eta for unknown users
+            default_eta_logit = self._eta_to_logit(eta_init)
+            if eta_learnable:
+                self.default_eta_logit = nn.Parameter(torch.tensor(default_eta_logit))
+            else:
+                self.register_buffer('default_eta_logit', torch.tensor(default_eta_logit))
+        else:
+            # Use single global eta (backward compatible)
+            self.use_per_user_eta = False
+            eta_logit = self._eta_to_logit(eta_init)
+
+            if eta_learnable:
+                self.eta_logit = nn.Parameter(torch.tensor(eta_logit))
+            else:
+                self.register_buffer('eta_logit', torch.tensor(eta_logit))
 
     def _eta_to_logit(self, eta: float) -> float:
         """Convert eta [0.5, 1.0] to logit space."""
@@ -70,14 +95,55 @@ class CrowdBTLoss(nn.Module):
 
     @property
     def eta(self) -> torch.Tensor:
-        """Current annotator reliability value."""
-        return 0.5 + 0.5 * torch.sigmoid(self.eta_logit)
+        """Current annotator reliability value (global or default)."""
+        if self.use_per_user_eta:
+            return 0.5 + 0.5 * torch.sigmoid(self.default_eta_logit)
+        else:
+            return 0.5 + 0.5 * torch.sigmoid(self.eta_logit)
+
+    def get_user_eta(self, user_id: str) -> torch.Tensor:
+        """Get eta for a specific user."""
+        if not self.use_per_user_eta:
+            return self.eta
+
+        if self.eta_learnable and user_id in self.user_eta_logits:
+            eta_logit = self.user_eta_logits[user_id]
+        elif hasattr(self, f'eta_logit_{user_id}'):
+            eta_logit = getattr(self, f'eta_logit_{user_id}')
+        else:
+            # Unknown user, use default
+            eta_logit = self.default_eta_logit
+
+        return 0.5 + 0.5 * torch.sigmoid(eta_logit)
+
+    def get_batch_etas(self, annotator_ids: Optional[List[str]] = None) -> torch.Tensor:
+        """
+        Get eta values for a batch of annotations.
+
+        Args:
+            annotator_ids: List of user IDs for each sample in batch
+
+        Returns:
+            Tensor of eta values [batch_size]
+        """
+        if not self.use_per_user_eta or annotator_ids is None:
+            # Use global/default eta for all samples
+            batch_size = len(annotator_ids) if annotator_ids else 1
+            return self.eta.expand(batch_size)
+
+        # Get per-user etas
+        etas = []
+        for user_id in annotator_ids:
+            etas.append(self.get_user_eta(user_id))
+
+        return torch.stack(etas)
 
     def forward(
         self,
         score_diff: torch.Tensor,
         labels: torch.Tensor,
-        weights: Optional[torch.Tensor] = None
+        weights: Optional[torch.Tensor] = None,
+        annotator_ids: Optional[List[str]] = None
     ) -> Dict[str, torch.Tensor]:
         """
         Compute the Crowd-BT loss.
@@ -89,9 +155,10 @@ class CrowdBTLoss(nn.Module):
                 -1 = img1 < img2
                 0 = draw
             weights: Optional comparison weights [B]
+            annotator_ids: Optional list of annotator IDs for per-user eta
 
         Returns:
-            Dict with 'loss', 'accuracy', 'eta'
+            Dict with 'loss', 'accuracy', 'eta' (or 'mean_eta' for per-user)
         """
         score_diff = score_diff.squeeze(-1)  # [B]
         labels = labels.float()
@@ -100,7 +167,9 @@ class CrowdBTLoss(nn.Module):
             weights = torch.ones_like(labels)
 
         batch_size = labels.shape[0]
-        eta = self.eta
+
+        # Get eta values for this batch (per-user or global)
+        eta = self.get_batch_etas(annotator_ids)  # [B] or scalar
 
         # Separate handling for different label types
         win_mask = (labels == 1)  # img1 > img2
@@ -113,9 +182,10 @@ class CrowdBTLoss(nn.Module):
         if win_mask.any():
             win_diff = score_diff[win_mask]
             win_weights = weights[win_mask]
+            win_eta = eta[win_mask] if eta.dim() > 0 else eta
 
             # P(img1 > img2) with noise
-            p_win = eta * torch.sigmoid(win_diff) + (1 - eta) * 0.5
+            p_win = win_eta * torch.sigmoid(win_diff) + (1 - win_eta) * 0.5
             loss_win = -torch.log(p_win + 1e-8)
             loss = loss + (loss_win * win_weights).sum()
 
@@ -123,9 +193,10 @@ class CrowdBTLoss(nn.Module):
         if lose_mask.any():
             lose_diff = score_diff[lose_mask]
             lose_weights = weights[lose_mask]
+            lose_eta = eta[lose_mask] if eta.dim() > 0 else eta
 
             # P(img2 > img1) with noise
-            p_lose = eta * torch.sigmoid(-lose_diff) + (1 - eta) * 0.5
+            p_lose = lose_eta * torch.sigmoid(-lose_diff) + (1 - lose_eta) * 0.5
             loss_lose = -torch.log(p_lose + 1e-8)
             loss = loss + (loss_lose * lose_weights).sum()
 
@@ -153,10 +224,13 @@ class CrowdBTLoss(nn.Module):
             correct = (pred == labels).float()
             accuracy = (correct * weights).sum() / (total_weight + 1e-8)
 
+        # Return mean eta for logging
+        mean_eta = eta.mean() if eta.dim() > 0 else eta
+
         return {
             'loss': loss,
             'accuracy': accuracy,
-            'eta': eta.detach(),
+            'eta': mean_eta.detach(),
         }
 
 
