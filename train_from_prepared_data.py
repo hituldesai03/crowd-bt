@@ -83,6 +83,8 @@ def main():
                         help='Local rank for distributed training (automatically set by torch.distributed.launch)')
     parser.add_argument('--world-size', type=int, default=1,
                         help='Number of processes for distributed training')
+    parser.add_argument('--sync-batchnorm', action='store_true',
+                        help='Use SyncBatchNorm in distributed training (can cause instability with small batches)')
 
     args = parser.parse_args()
 
@@ -109,6 +111,7 @@ def main():
     else:
         config.training.local_rank = args.local_rank
     config.training.world_size = args.world_size
+    config.training.use_sync_batchnorm = args.sync_batchnorm
 
     config.data.image_dir = args.image_dir
 
@@ -223,10 +226,15 @@ def main():
 
     # Wrap model with DistributedDataParallel if using distributed training
     if config.training.distributed:
-        # Convert BatchNorm to SyncBatchNorm for better distributed training
-        model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
-        if is_main_process():
-            print("Converted BatchNorm layers to SyncBatchNorm")
+        # Optionally convert BatchNorm to SyncBatchNorm
+        # Note: SyncBatchNorm can sometimes cause training instability
+        if config.training.use_sync_batchnorm:
+            model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
+            if is_main_process():
+                print("Converted BatchNorm layers to SyncBatchNorm")
+        else:
+            if is_main_process():
+                print("Using regular BatchNorm (not synchronized across GPUs)")
 
         model = DDP(
             model,

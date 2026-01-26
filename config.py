@@ -44,6 +44,7 @@ class TrainingConfig:
     distributed: bool = False
     local_rank: int = -1
     world_size: int = 1
+    use_sync_batchnorm: bool = False
 
 
 @dataclass
@@ -125,6 +126,7 @@ class Config:
                 'distributed': self.training.distributed,
                 'local_rank': self.training.local_rank,
                 'world_size': self.training.world_size,
+                'use_sync_batchnorm': self.training.use_sync_batchnorm,
             },
             'data': {
                 'bucket_name': self.data.bucket_name,
