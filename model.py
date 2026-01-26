@@ -41,12 +41,13 @@ class QualityScorer(nn.Module):
         self.backbone = BackboneWrapper(backbone_name, pretrained)
 
         # Scoring head: features -> quality score
+        # Note: inplace=False to avoid conflicts with DistributedDataParallel
         self.head = nn.Sequential(
             nn.Linear(self.backbone.output_dim, hidden_dim),
-            nn.ReLU(inplace=True),
+            nn.ReLU(inplace=False),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.ReLU(inplace=True),
+            nn.ReLU(inplace=False),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim // 2, 1)
         )

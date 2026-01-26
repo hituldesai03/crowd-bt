@@ -365,6 +365,11 @@ def train(
 
     # Wrap model with DistributedDataParallel if using distributed training
     if config.training.distributed:
+        # Convert BatchNorm to SyncBatchNorm for better distributed training
+        model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
+        if is_main_process():
+            print("Converted BatchNorm layers to SyncBatchNorm")
+
         model = DDP(
             model,
             device_ids=[config.training.local_rank] if device.startswith('cuda') else None,
