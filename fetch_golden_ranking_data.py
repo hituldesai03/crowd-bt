@@ -164,9 +164,9 @@ def main():
     parser.add_argument('--bucket', type=str, default='surface-quality-dataset',
                         help='S3 bucket name')
     parser.add_argument('--prefix', type=str,
-                        default='quality-comparison-toolkit/data/golden_ranking_patches/',
+                        default='quack_v2_data_gold_ranking_logs/',
                         help='S3 prefix for golden_ranking data')
-    parser.add_argument('--output-dir', type=str, default='training_data_golden_ranking',
+    parser.add_argument('--output-dir', type=str, default='training_data_golden_ranking2',
                         help='Local directory to save downloaded data')
 
     args = parser.parse_args()

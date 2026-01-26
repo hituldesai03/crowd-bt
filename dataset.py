@@ -5,6 +5,7 @@ PyTorch Dataset for pairwise image comparisons.
 import os
 import torch
 from torch.utils.data import Dataset, DataLoader
+from torch.utils.data.distributed import DistributedSampler
 from PIL import Image
 from torchvision import transforms
 from typing import List, Dict, Optional, Tuple
@@ -188,10 +189,20 @@ def create_data_loaders(
     image_dir: str = None,
     input_size: int = 448,
     batch_size: int = 32,
-    num_workers: int = 4
+    num_workers: int = 4,
+    distributed: bool = False
 ) -> Tuple[DataLoader, DataLoader]:
     """
     Create training and validation data loaders.
+
+    Args:
+        train_comparisons: List of training comparisons
+        val_comparisons: List of validation comparisons
+        image_dir: Directory containing images
+        input_size: Input image size
+        batch_size: Batch size per GPU
+        num_workers: Number of data loading workers
+        distributed: Whether to use DistributedSampler
 
     Returns:
         Tuple of (train_loader, val_loader)
@@ -210,10 +221,25 @@ def create_data_loaders(
         is_train=False
     )
 
+    # Use DistributedSampler for distributed training
+    train_sampler = None
+    val_sampler = None
+    if distributed:
+        train_sampler = DistributedSampler(
+            train_dataset,
+            shuffle=True,
+            drop_last=True
+        )
+        val_sampler = DistributedSampler(
+            val_dataset,
+            shuffle=False
+        )
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
-        shuffle=True,
+        shuffle=(train_sampler is None),  # Don't shuffle if using sampler
+        sampler=train_sampler,
         num_workers=num_workers,
         pin_memory=True,
         drop_last=True
@@ -223,6 +249,7 @@ def create_data_loaders(
         val_dataset,
         batch_size=batch_size,
         shuffle=False,
+        sampler=val_sampler,
         num_workers=num_workers,
         pin_memory=True
     )

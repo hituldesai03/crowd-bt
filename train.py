@@ -7,6 +7,8 @@ import os
 import json
 import torch
 import torch.nn as nn
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from tqdm import tqdm
@@ -30,6 +32,48 @@ from data_loader import (
 from evaluate import full_evaluation, print_evaluation_report
 
 
+def setup_distributed(rank: int, world_size: int, backend: str = 'nccl'):
+    """
+    Initialize the distributed environment.
+
+    Args:
+        rank: Rank of the current process
+        world_size: Total number of processes
+        backend: Backend to use ('nccl' for GPU, 'gloo' for CPU)
+    """
+    os.environ['MASTER_ADDR'] = os.environ.get('MASTER_ADDR', 'localhost')
+    os.environ['MASTER_PORT'] = os.environ.get('MASTER_PORT', '12355')
+
+    dist.init_process_group(
+        backend=backend,
+        init_method='env://',
+        world_size=world_size,
+        rank=rank
+    )
+
+    # Set device for this process
+    if backend == 'nccl':
+        torch.cuda.set_device(rank)
+
+
+def cleanup_distributed():
+    """Clean up the distributed environment."""
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def is_main_process() -> bool:
+    """Check if this is the main process (rank 0)."""
+    return not dist.is_initialized() or dist.get_rank() == 0
+
+
+def get_rank() -> int:
+    """Get the rank of the current process."""
+    if not dist.is_initialized():
+        return 0
+    return dist.get_rank()
+
+
 def train_epoch(
     model: nn.Module,
     train_loader,
@@ -45,7 +89,8 @@ def train_epoch(
     total_acc = 0.0
     num_batches = 0
 
-    pbar = tqdm(train_loader, desc="Training")
+    # Only show progress bar on main process
+    pbar = tqdm(train_loader, desc="Training", disable=not is_main_process())
     for batch_idx, batch in enumerate(pbar):
         img1 = batch['img1'].to(device)
         img2 = batch['img2'].to(device)
@@ -102,7 +147,8 @@ def validate(
     total_acc = 0.0
     num_batches = 0
 
-    for batch in tqdm(val_loader, desc="Validating"):
+    # Only show progress bar on main process
+    for batch in tqdm(val_loader, desc="Validating", disable=not is_main_process()):
         img1 = batch['img1'].to(device)
         img2 = batch['img2'].to(device)
         labels = batch['label'].to(device)
@@ -156,9 +202,12 @@ def save_checkpoint(
     is_best: bool = False
 ):
     """Save a training checkpoint."""
+    # Get the actual model (unwrap DDP if necessary)
+    model_to_save = model.module if isinstance(model, DDP) else model
+
     checkpoint = {
         'epoch': epoch,
-        'model': model.state_dict(),
+        'model': model_to_save.state_dict(),
         'optimizer': optimizer.state_dict(),
         'scheduler': scheduler.state_dict() if scheduler else None,
         'metrics': metrics,
@@ -200,17 +249,42 @@ def train(
     if config is None:
         config = default_config
 
-    device = config.training.device
-    if device == "cuda" and not torch.cuda.is_available():
-        print("CUDA not available, using CPU")
-        device = "cpu"
+    # Initialize distributed training if enabled
+    if config.training.distributed:
+        rank = config.training.local_rank
+        world_size = config.training.world_size
 
-    print(f"Using device: {device}")
-    print(f"Backbone: {config.training.backbone_name}")
-    print(f"Input size: {config.training.input_size}")
+        # Use NCCL backend for GPU, gloo for CPU
+        backend = 'nccl' if config.training.device == 'cuda' else 'gloo'
+        setup_distributed(rank, world_size, backend)
+
+        # Set device to the local GPU for this process
+        if config.training.device == "cuda":
+            device = f"cuda:{rank}"
+            torch.cuda.set_device(rank)
+        else:
+            device = "cpu"
+
+        if is_main_process():
+            print(f"Distributed training initialized with {world_size} processes")
+            print(f"Using device: {device} (rank {rank})")
+    else:
+        device = config.training.device
+        if device == "cuda" and not torch.cuda.is_available():
+            print("CUDA not available, using CPU")
+            device = "cpu"
+        print(f"Using device: {device}")
+
+    if is_main_process():
+        print(f"Backbone: {config.training.backbone_name}")
+        print(f"Input size: {config.training.input_size}")
+        if config.training.distributed:
+            print(f"Batch size per GPU: {config.training.batch_size}")
+            print(f"Effective batch size: {config.training.batch_size * world_size}")
 
     # Load comparison data
-    print("\nLoading comparison data...")
+    if is_main_process():
+        print("\nLoading comparison data...")
     use_fixed_eta = False  # Will be set to True if using per-annotation reliability
 
     if data_source == "s3":
@@ -230,9 +304,10 @@ def train(
         )
         use_fixed_eta = True
 
-        print(f"\nUsing per-annotation fixed eta from {len(user_reliabilities)} users")
-        print(f"User reliability range: [{min(user_reliabilities.values()):.3f}, "
-              f"{max(user_reliabilities.values()):.3f}]")
+        if is_main_process():
+            print(f"\nUsing per-annotation fixed eta from {len(user_reliabilities)} users")
+            print(f"User reliability range: [{min(user_reliabilities.values()):.3f}, "
+                  f"{max(user_reliabilities.values()):.3f}]")
     else:
         # Load from local files (no per-user reliability available)
         local_comparisons = load_local_comparisons(data_dir=config.data.local_data_dir)
@@ -254,9 +329,11 @@ def train(
                 'weight': 1.0,
                 'pair_type': comp.get('type', 'unknown'),
             })
-        print("\nUsing global eta (no per-annotation reliability available)")
+        if is_main_process():
+            print("\nUsing global eta (no per-annotation reliability available)")
 
-    print(f"Total training samples: {len(training_data)}")
+    if is_main_process():
+        print(f"Total training samples: {len(training_data)}")
 
     # Split data
     train_data, val_data = split_comparisons(
@@ -272,10 +349,12 @@ def train(
         image_dir=config.data.image_dir,
         input_size=config.training.input_size,
         batch_size=config.training.batch_size,
-        num_workers=config.training.num_workers
+        num_workers=config.training.num_workers,
+        distributed=config.training.distributed
     )
 
-    print(f"Train batches: {len(train_loader)}, Val batches: {len(val_loader)}")
+    if is_main_process():
+        print(f"Train batches: {len(train_loader)}, Val batches: {len(val_loader)}")
 
     # Create model
     model = QualityScorer(
@@ -283,6 +362,16 @@ def train(
         pretrained=config.training.pretrained
     )
     model = model.to(device)
+
+    # Wrap model with DistributedDataParallel if using distributed training
+    if config.training.distributed:
+        model = DDP(
+            model,
+            device_ids=[config.training.local_rank] if device.startswith('cuda') else None,
+            output_device=config.training.local_rank if device.startswith('cuda') else None
+        )
+        if is_main_process():
+            print("Model wrapped with DistributedDataParallel")
 
     # Create loss function
     # When use_fixed_eta=True, per-annotation reliability is passed at forward() time
@@ -293,12 +382,13 @@ def train(
     )
     criterion = criterion.to(device)
 
-    if use_fixed_eta:
-        print("Loss uses per-annotation reliability as fixed eta (no learning)")
-    else:
-        print(f"Loss uses global eta initialized to {config.training.eta_init:.3f}")
-        if config.training.eta_learnable:
-            print("Global eta is learnable")
+    if is_main_process():
+        if use_fixed_eta:
+            print("Loss uses per-annotation reliability as fixed eta (no learning)")
+        else:
+            print(f"Loss uses global eta initialized to {config.training.eta_init:.3f}")
+            if config.training.eta_learnable:
+                print("Global eta is learnable")
 
     # Optimizer - only include global eta if learnable and not using fixed eta
     params = list(model.parameters())
@@ -326,17 +416,25 @@ def train(
     if checkpoint_path is None and auto_resume:
         checkpoint_path = find_latest_checkpoint(config.training.checkpoint_dir)
         if checkpoint_path:
-            print(f"\nFound existing checkpoint: {checkpoint_path}")
-            print("Auto-resuming training (use --no-auto-resume to disable)")
+            if is_main_process():
+                print(f"\nFound existing checkpoint: {checkpoint_path}")
+                print("Auto-resuming training (use --no-auto-resume to disable)")
         else:
-            print("\nNo checkpoint found, starting training from scratch")
+            if is_main_process():
+                print("\nNo checkpoint found, starting training from scratch")
     elif checkpoint_path is None:
-        print("\nStarting training from scratch (auto-resume disabled)")
+        if is_main_process():
+            print("\nStarting training from scratch (auto-resume disabled)")
 
     if checkpoint_path and os.path.exists(checkpoint_path):
-        print(f"Resuming from {checkpoint_path}")
+        if is_main_process():
+            print(f"Resuming from {checkpoint_path}")
         checkpoint = torch.load(checkpoint_path, map_location=device)
-        model.load_state_dict(checkpoint['model'])
+
+        # Get the actual model (unwrap DDP if necessary)
+        model_to_load = model.module if isinstance(model, DDP) else model
+        model_to_load.load_state_dict(checkpoint['model'])
+
         optimizer.load_state_dict(checkpoint['optimizer'])
         if checkpoint['scheduler']:
             scheduler.load_state_dict(checkpoint['scheduler'])
@@ -347,7 +445,8 @@ def train(
         if 'eta_logit' in checkpoint and hasattr(criterion, 'eta_logit'):
             criterion.eta_logit.data = torch.tensor(checkpoint['eta_logit'])
 
-        print(f"Resumed from epoch {start_epoch} with best val acc: {best_val_acc:.3f}")
+        if is_main_process():
+            print(f"Resumed from epoch {start_epoch} with best val acc: {best_val_acc:.3f}")
 
     # Create checkpoint directory
     os.makedirs(config.training.checkpoint_dir, exist_ok=True)
@@ -357,13 +456,20 @@ def train(
     training_log = []
 
     # Training loop
-    print("\nStarting training...")
+    if is_main_process():
+        print("\nStarting training...")
+
     for epoch in range(start_epoch, config.training.epochs):
-        print(f"\n{'='*50}")
-        print(f"Epoch {epoch + 1}/{config.training.epochs}")
-        print(f"Learning rate: {scheduler.get_last_lr()[0]:.6f}")
-        if hasattr(criterion, 'eta'):
-            print(f"Eta (annotator reliability): {criterion.eta.item():.4f}")
+        # Set epoch for DistributedSampler to ensure proper shuffling
+        if config.training.distributed:
+            train_loader.sampler.set_epoch(epoch)
+
+        if is_main_process():
+            print(f"\n{'='*50}")
+            print(f"Epoch {epoch + 1}/{config.training.epochs}")
+            print(f"Learning rate: {scheduler.get_last_lr()[0]:.6f}")
+            if hasattr(criterion, 'eta'):
+                print(f"Eta (annotator reliability): {criterion.eta.item():.4f}")
 
         # Train
         train_metrics = train_epoch(
@@ -377,129 +483,144 @@ def train(
         # Update scheduler
         scheduler.step()
 
-        # Log
-        epoch_log = {
-            'epoch': epoch + 1,
-            'train_loss': train_metrics['loss'],
-            'train_accuracy': train_metrics['accuracy'],
-            'val_loss': val_metrics['loss'],
-            'val_accuracy': val_metrics['accuracy'],
-            'learning_rate': scheduler.get_last_lr()[0],
-            'eta': criterion.eta.item() if hasattr(criterion, 'eta') else None,
-            'timestamp': datetime.now().isoformat()
-        }
-        training_log.append(epoch_log)
+        # Log (only on main process)
+        if is_main_process():
+            epoch_log = {
+                'epoch': epoch + 1,
+                'train_loss': train_metrics['loss'],
+                'train_accuracy': train_metrics['accuracy'],
+                'val_loss': val_metrics['loss'],
+                'val_accuracy': val_metrics['accuracy'],
+                'learning_rate': scheduler.get_last_lr()[0],
+                'eta': criterion.eta.item() if hasattr(criterion, 'eta') else None,
+                'timestamp': datetime.now().isoformat()
+            }
+            training_log.append(epoch_log)
 
-        print(f"\nTrain Loss: {train_metrics['loss']:.4f}, Train Acc: {train_metrics['accuracy']:.3f}")
-        print(f"Val Loss: {val_metrics['loss']:.4f}, Val Acc: {val_metrics['accuracy']:.3f}")
+            print(f"\nTrain Loss: {train_metrics['loss']:.4f}, Train Acc: {train_metrics['accuracy']:.3f}")
+            print(f"Val Loss: {val_metrics['loss']:.4f}, Val Acc: {val_metrics['accuracy']:.3f}")
 
-        # Save best model
-        if val_metrics['accuracy'] > best_val_acc:
-            best_val_acc = val_metrics['accuracy']
-            best_path = os.path.join(config.training.checkpoint_dir, 'best_model.pt')
+            # Save best model
+            if val_metrics['accuracy'] > best_val_acc:
+                best_val_acc = val_metrics['accuracy']
+                best_path = os.path.join(config.training.checkpoint_dir, 'best_model.pt')
+                save_checkpoint(
+                    model, optimizer, scheduler, criterion,
+                    epoch, {'val_accuracy': val_metrics['accuracy'], **val_metrics},
+                    best_path, config, is_best=True
+                )
+                print(f"New best model! Val Acc: {best_val_acc:.3f}")
+
+            # Save latest checkpoint after every epoch for auto-resume
+            last_path = os.path.join(config.training.checkpoint_dir, 'last.pt')
             save_checkpoint(
                 model, optimizer, scheduler, criterion,
                 epoch, {'val_accuracy': val_metrics['accuracy'], **val_metrics},
-                best_path, config, is_best=True
+                last_path, config, is_best=False
             )
-            print(f"New best model! Val Acc: {best_val_acc:.3f}")
 
-        # Save latest checkpoint after every epoch for auto-resume
-        last_path = os.path.join(config.training.checkpoint_dir, 'last.pt')
+            # Save periodic checkpoint
+            if (epoch + 1) % config.training.save_every == 0:
+                ckpt_path = os.path.join(
+                    config.training.checkpoint_dir,
+                    f'checkpoint_epoch_{epoch + 1}.pt'
+                )
+                save_checkpoint(
+                    model, optimizer, scheduler, criterion,
+                    epoch, {'val_accuracy': val_metrics['accuracy'], **val_metrics},
+                    ckpt_path, config, is_best=False
+                )
+
+            # Save training log
+            with open(log_path, 'w') as f:
+                json.dump(training_log, f, indent=2)
+
+        # Synchronize all processes before continuing to next epoch
+        if config.training.distributed:
+            dist.barrier()
+
+    # Save final model (only on main process)
+    if is_main_process():
+        final_path = os.path.join(config.training.checkpoint_dir, 'final_model.pt')
         save_checkpoint(
             model, optimizer, scheduler, criterion,
-            epoch, {'val_accuracy': val_metrics['accuracy'], **val_metrics},
-            last_path, config, is_best=False
+            config.training.epochs - 1,
+            {'val_accuracy': val_metrics['accuracy'], **val_metrics},
+            final_path, config
         )
 
-        # Save periodic checkpoint
-        if (epoch + 1) % config.training.save_every == 0:
-            ckpt_path = os.path.join(
-                config.training.checkpoint_dir,
-                f'checkpoint_epoch_{epoch + 1}.pt'
+        print(f"\nTraining complete!")
+        print(f"Best validation accuracy: {best_val_acc:.3f}")
+        print(f"Models saved to: {config.training.checkpoint_dir}")
+
+    # Synchronize before evaluation
+    if config.training.distributed:
+        dist.barrier()
+
+    # Run full evaluation on the best model (only on main process)
+    if is_main_process():
+        print("\n" + "=" * 50)
+        print("Running Full Evaluation on Best Model")
+        print("=" * 50)
+
+        # Load the best model for evaluation
+        best_model_path = os.path.join(config.training.checkpoint_dir, 'best_model.pt')
+        if os.path.exists(best_model_path):
+            from model import load_model
+            eval_model = load_model(
+                best_model_path,
+                backbone_name=config.training.backbone_name,
+                device=device
             )
-            save_checkpoint(
-                model, optimizer, scheduler, criterion,
-                epoch, {'val_accuracy': val_metrics['accuracy'], **val_metrics},
-                ckpt_path, config, is_best=False
+
+            # Load comparisons for evaluation
+            if data_source == "local":
+                eval_comparisons = load_local_comparisons(data_dir=config.data.local_data_dir)
+            else:
+                eval_comparisons = training_data
+
+            # Run evaluation
+            eval_results = full_evaluation(
+                eval_model,
+                config,
+                comparisons=eval_comparisons,
+                device=device
             )
 
-        # Save training log
-        with open(log_path, 'w') as f:
-            json.dump(training_log, f, indent=2)
+            # Print evaluation report
+            print_evaluation_report(eval_results)
 
-    # Save final model
-    final_path = os.path.join(config.training.checkpoint_dir, 'final_model.pt')
-    save_checkpoint(
-        model, optimizer, scheduler, criterion,
-        config.training.epochs - 1,
-        {'val_accuracy': val_metrics['accuracy'], **val_metrics},
-        final_path, config
-    )
+            # Add evaluation results to training log
+            eval_log_entry = {
+                'evaluation': {
+                    'overall_accuracy': eval_results.get('overall_accuracy'),
+                    'kendall_tau': eval_results.get('kendall_tau', {}).get('tau'),
+                    'spearman_rho': eval_results.get('spearman_rho', {}).get('rho'),
+                    'gold_hierarchy_preserved': eval_results.get('gold_hierarchy', {}).get('ordering_preserved'),
+                    'gold_hierarchy_violations': eval_results.get('gold_hierarchy', {}).get('violation_count', 0),
+                    'accuracy_by_pair_type': {
+                        k: v.get('accuracy') for k, v in eval_results.get('accuracy_by_pair_type', {}).items()
+                    }
+                },
+                'timestamp': datetime.now().isoformat()
+            }
+            training_log.append(eval_log_entry)
 
-    print(f"\nTraining complete!")
-    print(f"Best validation accuracy: {best_val_acc:.3f}")
-    print(f"Models saved to: {config.training.checkpoint_dir}")
+            # Save updated training log with evaluation results
+            with open(log_path, 'w') as f:
+                json.dump(training_log, f, indent=2)
 
-    # Run full evaluation on the best model
-    print("\n" + "=" * 50)
-    print("Running Full Evaluation on Best Model")
-    print("=" * 50)
-
-    # Load the best model for evaluation
-    best_model_path = os.path.join(config.training.checkpoint_dir, 'best_model.pt')
-    if os.path.exists(best_model_path):
-        from model import load_model
-        eval_model = load_model(
-            best_model_path,
-            backbone_name=config.training.backbone_name,
-            device=device
-        )
-
-        # Load comparisons for evaluation
-        if data_source == "local":
-            eval_comparisons = load_local_comparisons(data_dir=config.data.local_data_dir)
+            # Save full evaluation results separately
+            eval_results_path = os.path.join(config.training.checkpoint_dir, 'evaluation_results.json')
+            with open(eval_results_path, 'w') as f:
+                json.dump(eval_results, f, indent=2)
+            print(f"\nFull evaluation results saved to {eval_results_path}")
         else:
-            eval_comparisons = training_data
+            print(f"Warning: Best model not found at {best_model_path}, skipping evaluation")
 
-        # Run evaluation
-        eval_results = full_evaluation(
-            eval_model,
-            config,
-            comparisons=eval_comparisons,
-            device=device
-        )
-
-        # Print evaluation report
-        print_evaluation_report(eval_results)
-
-        # Add evaluation results to training log
-        eval_log_entry = {
-            'evaluation': {
-                'overall_accuracy': eval_results.get('overall_accuracy'),
-                'kendall_tau': eval_results.get('kendall_tau', {}).get('tau'),
-                'spearman_rho': eval_results.get('spearman_rho', {}).get('rho'),
-                'gold_hierarchy_preserved': eval_results.get('gold_hierarchy', {}).get('ordering_preserved'),
-                'gold_hierarchy_violations': eval_results.get('gold_hierarchy', {}).get('violation_count', 0),
-                'accuracy_by_pair_type': {
-                    k: v.get('accuracy') for k, v in eval_results.get('accuracy_by_pair_type', {}).items()
-                }
-            },
-            'timestamp': datetime.now().isoformat()
-        }
-        training_log.append(eval_log_entry)
-
-        # Save updated training log with evaluation results
-        with open(log_path, 'w') as f:
-            json.dump(training_log, f, indent=2)
-
-        # Save full evaluation results separately
-        eval_results_path = os.path.join(config.training.checkpoint_dir, 'evaluation_results.json')
-        with open(eval_results_path, 'w') as f:
-            json.dump(eval_results, f, indent=2)
-        print(f"\nFull evaluation results saved to {eval_results_path}")
-    else:
-        print(f"Warning: Best model not found at {best_model_path}, skipping evaluation")
+    # Clean up distributed training
+    if config.training.distributed:
+        cleanup_distributed()
 
     return model, training_log
 
@@ -552,6 +673,14 @@ def main():
     parser.add_argument('--num-workers', type=int, default=4,
                         help='Number of data loading workers')
 
+    # Distributed training args
+    parser.add_argument('--distributed', action='store_true',
+                        help='Enable distributed training')
+    parser.add_argument('--local_rank', type=int, default=-1,
+                        help='Local rank for distributed training (automatically set by torch.distributed.launch)')
+    parser.add_argument('--world-size', type=int, default=1,
+                        help='Number of processes for distributed training')
+
     # Config file
     parser.add_argument('--config', type=str, default=None,
                         help='Path to YAML config file')
@@ -576,6 +705,15 @@ def main():
     config.training.checkpoint_dir = args.checkpoint_dir
     config.training.device = args.device
     config.training.num_workers = args.num_workers
+
+    # Distributed training settings
+    config.training.distributed = args.distributed
+    # Handle both automatic (from torch.distributed.launch) and manual local_rank
+    if 'LOCAL_RANK' in os.environ:
+        config.training.local_rank = int(os.environ['LOCAL_RANK'])
+    else:
+        config.training.local_rank = args.local_rank
+    config.training.world_size = args.world_size
 
     config.data.image_dir = args.image_dir
     config.data.local_data_dir = args.data_dir

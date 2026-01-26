@@ -33,7 +33,7 @@ python visualize_holdout_calibrated.py \
   --checkpoint results_golden_overfit/best_model.pt \
   --calibrator score_calibrator.pkl \
   --backbone efficientnet_b4 \
-  --output-dir holdout_visualizations_calibrated \
+  --output-dir holdout_visualizations_calibrated_gold \
   --max-grid-images 184
 
 if [ $? -ne 0 ]; then

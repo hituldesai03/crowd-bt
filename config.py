@@ -40,6 +40,11 @@ class TrainingConfig:
     # Device
     device: str = "cuda"
 
+    # Distributed training
+    distributed: bool = False
+    local_rank: int = -1
+    world_size: int = 1
+
 
 @dataclass
 class DataConfig:
@@ -117,6 +122,9 @@ class Config:
                 'save_every': self.training.save_every,
                 'log_interval': self.training.log_interval,
                 'device': self.training.device,
+                'distributed': self.training.distributed,
+                'local_rank': self.training.local_rank,
+                'world_size': self.training.world_size,
             },
             'data': {
                 'bucket_name': self.data.bucket_name,
