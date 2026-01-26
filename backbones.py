@@ -55,19 +55,21 @@ BACKBONE_REGISTRY: Dict[str, Dict] = {
 }
 
 
-def get_backbone(name: str, pretrained: bool = True) -> Tuple[nn.Module, int]:
+def get_backbone(name: str, pretrained: bool = True, scriptable: bool = False) -> Tuple[nn.Module, int]:
     """
     Create a backbone model using timm.
 
     Args:
         name: Name of the backbone (must be in BACKBONE_REGISTRY or a valid timm model)
         pretrained: Whether to load pretrained weights
+        scriptable: If True, disables in-place operations for TorchScript/DDP compatibility
 
     Returns:
         Tuple of (backbone_model, feature_dimension)
     """
     # Create model without classifier head
-    model = timm.create_model(name, pretrained=pretrained, num_classes=0)
+    # scriptable=True disables in-place operations, making it compatible with DDP
+    model = timm.create_model(name, pretrained=pretrained, num_classes=0, scriptable=scriptable)
 
     # Get feature dimension
     if name in BACKBONE_REGISTRY:
