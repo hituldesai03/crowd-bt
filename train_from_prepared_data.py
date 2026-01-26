@@ -32,6 +32,129 @@ from train import (
 )
 
 
+def filter_near_ties_gold(train_data, val_data, model, config, device, threshold=0.25):
+    """
+    Remove near-ties from gold_gold pairs only.
+
+    Args:
+        train_data: List of training comparisons
+        val_data: List of validation comparisons
+        model: Trained model to compute scores
+        config: Configuration object
+        device: Device to run on
+        threshold: Fraction of gold_gold pairs to remove (bottom X% by score difference)
+
+    Returns:
+        filtered_train_data, filtered_val_data
+    """
+    from PIL import Image
+    from torchvision import transforms
+
+    # Separate gold_gold pairs from others
+    train_gold = [c for c in train_data if c.get('pair_type') == 'gold_gold']
+    train_other = [c for c in train_data if c.get('pair_type') != 'gold_gold']
+
+    val_gold = [c for c in val_data if c.get('pair_type') == 'gold_gold']
+    val_other = [c for c in val_data if c.get('pair_type') != 'gold_gold']
+
+    if not train_gold and not val_gold:
+        if is_main_process():
+            print("No gold_gold pairs found. Skipping near-tie removal.")
+        return train_data, val_data
+
+    # Setup image transformation
+    transform = transforms.Compose([
+        transforms.Resize((config.training.input_size, config.training.input_size)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+
+    def compute_score_diff(comparison):
+        """Compute |s_i - s_j| for a comparison."""
+        img1_path = os.path.join(config.data.image_dir, comparison['img1'])
+        img2_path = os.path.join(config.data.image_dir, comparison['img2'])
+
+        try:
+            img1 = Image.open(img1_path).convert('RGB')
+            img2 = Image.open(img2_path).convert('RGB')
+
+            img1_tensor = transform(img1).unsqueeze(0).to(device)
+            img2_tensor = transform(img2).unsqueeze(0).to(device)
+
+            with torch.no_grad():
+                score1 = model(img1_tensor).item()
+                score2 = model(img2_tensor).item()
+
+            return abs(score1 - score2)
+        except Exception as e:
+            if is_main_process():
+                print(f"Warning: Failed to process pair ({comparison['img1']}, {comparison['img2']}): {e}")
+            return float('inf')  # Keep problematic pairs (don't filter them out)
+
+    # Filter train gold_gold pairs
+    if train_gold:
+        if is_main_process():
+            print(f"\nFiltering near-ties from {len(train_gold)} train gold_gold pairs...")
+
+        model.eval()
+        score_diffs = []
+        for comp in tqdm(train_gold, desc="Computing score differences (train)", disable=not is_main_process()):
+            diff = compute_score_diff(comp)
+            score_diffs.append((comp, diff))
+
+        # Sort by score difference (ascending)
+        score_diffs.sort(key=lambda x: x[1])
+
+        # Remove bottom threshold% (near-ties)
+        num_to_remove = int(len(score_diffs) * threshold)
+        filtered_train_gold = [comp for comp, _ in score_diffs[num_to_remove:]]
+
+        if is_main_process():
+            print(f"Removed {num_to_remove} near-ties from train gold_gold pairs")
+            print(f"Score diff range of removed pairs: [{score_diffs[0][1]:.4f}, {score_diffs[num_to_remove-1][1]:.4f}]")
+            if len(filtered_train_gold) > 0:
+                print(f"Score diff range of kept pairs: [{score_diffs[num_to_remove][1]:.4f}, {score_diffs[-1][1]:.4f}]")
+    else:
+        filtered_train_gold = train_gold
+
+    # Filter val gold_gold pairs
+    if val_gold:
+        if is_main_process():
+            print(f"\nFiltering near-ties from {len(val_gold)} val gold_gold pairs...")
+
+        model.eval()
+        score_diffs = []
+        for comp in tqdm(val_gold, desc="Computing score differences (val)", disable=not is_main_process()):
+            diff = compute_score_diff(comp)
+            score_diffs.append((comp, diff))
+
+        # Sort by score difference (ascending)
+        score_diffs.sort(key=lambda x: x[1])
+
+        # Remove bottom threshold% (near-ties)
+        num_to_remove = int(len(score_diffs) * threshold)
+        filtered_val_gold = [comp for comp, _ in score_diffs[num_to_remove:]]
+
+        if is_main_process():
+            print(f"Removed {num_to_remove} near-ties from val gold_gold pairs")
+            print(f"Score diff range of removed pairs: [{score_diffs[0][1]:.4f}, {score_diffs[num_to_remove-1][1]:.4f}]")
+            if len(filtered_val_gold) > 0:
+                print(f"Score diff range of kept pairs: [{score_diffs[num_to_remove][1]:.4f}, {score_diffs[-1][1]:.4f}]")
+    else:
+        filtered_val_gold = val_gold
+
+    # Combine filtered gold_gold pairs back with other pairs
+    filtered_train_data = train_other + filtered_train_gold
+    filtered_val_data = val_other + filtered_val_gold
+
+    if is_main_process():
+        print(f"\nFinal dataset sizes after filtering:")
+        print(f"Train: {len(train_data)} -> {len(filtered_train_data)} ({len(train_data) - len(filtered_train_data)} removed)")
+        print(f"Val: {len(val_data)} -> {len(filtered_val_data)} ({len(val_data) - len(filtered_val_data)} removed)")
+
+    return filtered_train_data, filtered_val_data
+
+
 def main():
     parser = argparse.ArgumentParser(description='Train from prepared data')
 
@@ -85,6 +208,14 @@ def main():
                         help='Number of processes for distributed training')
     parser.add_argument('--sync-batchnorm', action='store_true',
                         help='Use SyncBatchNorm in distributed training (can cause instability with small batches)')
+
+    # Near-tie removal args (for gold_gold pairs only)
+    parser.add_argument('--remove-near-ties', action='store_true',
+                        help='Remove near-ties from gold_gold pairs after warmup')
+    parser.add_argument('--near-tie-threshold', type=float, default=0.25,
+                        help='Fraction of gold_gold pairs to remove (bottom X%% by score difference)')
+    parser.add_argument('--near-tie-warmup-epochs', type=int, default=3,
+                        help='Number of warmup epochs before filtering near-ties')
 
     args = parser.parse_args()
 
@@ -319,6 +450,7 @@ def main():
         print("="*60)
 
     training_log = []
+    near_ties_filtered = False  # Track if we've already filtered near-ties
 
     for epoch in range(start_epoch, config.training.epochs):
         # Set epoch for DistributedSampler to ensure proper shuffling
@@ -343,6 +475,58 @@ def main():
 
         # Update scheduler
         scheduler.step()
+
+        # Filter near-ties after warmup (only once, all processes must do this)
+        if (args.remove_near_ties and
+            not near_ties_filtered and
+            epoch + 1 >= args.near_tie_warmup_epochs):
+
+            # Synchronize before filtering
+            if config.training.distributed:
+                dist.barrier()
+
+            if is_main_process():
+                print("\n" + "="*60)
+                print(f"Warmup complete ({epoch + 1} epochs). Filtering near-ties from gold_gold pairs...")
+                print("="*60)
+
+            # Get the actual model (unwrap DDP if necessary)
+            model_for_inference = model.module if isinstance(model, DDP) else model
+
+            # Filter near-ties (all processes must do this to stay in sync)
+            filtered_train_data, filtered_val_data = filter_near_ties_gold(
+                train_data, val_data,
+                model_for_inference, config, device,
+                threshold=args.near_tie_threshold
+            )
+
+            # Update the data references
+            train_data = filtered_train_data
+            val_data = filtered_val_data
+
+            # Recreate data loaders with filtered data
+            if is_main_process():
+                print("\nRecreating data loaders with filtered data...")
+
+            train_loader, val_loader = create_data_loaders(
+                train_data,
+                val_data,
+                image_dir=config.data.image_dir,
+                input_size=config.training.input_size,
+                batch_size=config.training.batch_size,
+                num_workers=config.training.num_workers,
+                distributed=config.training.distributed
+            )
+
+            if is_main_process():
+                print(f"New train batches: {len(train_loader)}, New val batches: {len(val_loader)}")
+                print("="*60 + "\n")
+
+            near_ties_filtered = True
+
+            # Synchronize all processes after filtering
+            if config.training.distributed:
+                dist.barrier()
 
         # Log (only on main process)
         if is_main_process():
