@@ -12,18 +12,39 @@ Distributed training enables you to:
 
 The implementation uses PyTorch's DistributedDataParallel (DDP) for efficient multi-GPU training.
 
+### Which Script to Use?
+
+- **train_distributed.sh**: Use for standard training with data loaded from local files or S3
+  - Automatically loads and splits comparison data
+  - Suitable for initial training runs
+
+- **train_distributed_prepared.sh**: Use for training with pre-prepared and pre-split data
+  - Loads pre-split train/val data from JSON files
+  - Useful when you want consistent train/val splits across experiments
+  - Supports data prepared with `prepare_s3_data.py` or similar tools
+
 ## Quick Start
 
 ### Single Node, Multiple GPUs
 
-The easiest way to launch distributed training is using the provided script:
+The easiest way to launch distributed training is using the provided scripts:
 
+**For standard training (train.py):**
 ```bash
 # Train on 4 GPUs
 ./train_distributed.sh 4 --epochs 20 --batch-size 16
 
 # Train on 2 GPUs with custom settings
 ./train_distributed.sh 2 --data-source s3 --backbone efficientnet_b5 --lr 5e-5
+```
+
+**For training with pre-prepared data (train_from_prepared_data.py):**
+```bash
+# Train on 2 GPUs with prepared data
+./train_distributed_prepared.sh 2 --data-dir ./training_data --image-dir ./data/images --epochs 50
+
+# Train on 4 GPUs with custom settings
+./train_distributed_prepared.sh 4 --data-dir ./training_data --image-dir ./data/images --batch-size 16 --lr 2e-4
 ```
 
 ### Manual Launch
@@ -213,7 +234,9 @@ To verify distributed training is working correctly:
 
 ## Example Configurations
 
-### Small Model, 2 GPUs
+### Standard Training (train_distributed.sh)
+
+#### Small Model, 2 GPUs
 ```bash
 ./train_distributed.sh 2 \
     --backbone efficientnet_b3 \
@@ -222,7 +245,7 @@ To verify distributed training is working correctly:
     --lr 2e-4
 ```
 
-### Large Model, 4 GPUs
+#### Large Model, 4 GPUs
 ```bash
 ./train_distributed.sh 4 \
     --backbone efficientnet_b5 \
@@ -231,7 +254,7 @@ To verify distributed training is working correctly:
     --lr 4e-4
 ```
 
-### Full Configuration, 8 GPUs
+#### Full Configuration, 8 GPUs
 ```bash
 ./train_distributed.sh 8 \
     --data-source s3 \
@@ -241,5 +264,41 @@ To verify distributed training is working correctly:
     --epochs 50 \
     --lr 8e-4 \
     --weight-decay 1e-5 \
+    --num-workers 8
+```
+
+### Prepared Data Training (train_distributed_prepared.sh)
+
+#### Basic Configuration, 2 GPUs
+```bash
+./train_distributed_prepared.sh 2 \
+    --data-dir ./training_data \
+    --image-dir ./data/images \
+    --batch-size 32 \
+    --epochs 50
+```
+
+#### Custom Settings, 4 GPUs
+```bash
+./train_distributed_prepared.sh 4 \
+    --data-dir ./training_data_golden_ranking \
+    --image-dir ./data/gold_ranking_patches \
+    --backbone efficientnet_b4 \
+    --batch-size 16 \
+    --epochs 50 \
+    --eta-init 0.98 \
+    --lr 2e-4
+```
+
+#### Large Scale, 8 GPUs
+```bash
+./train_distributed_prepared.sh 8 \
+    --data-dir ./training_data \
+    --image-dir ./data/images \
+    --backbone efficientnet_b5 \
+    --input-size 512 \
+    --batch-size 8 \
+    --epochs 100 \
+    --lr 4e-4 \
     --num-workers 8
 ```
