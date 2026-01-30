@@ -41,11 +41,16 @@ def compute_global_metrics(gt_scores: np.ndarray, pred_scores: np.ndarray):
     # 2. Global NDCG (Linear)
     ndcg_global = compute_linear_ndcg(gt_scores, pred_scores)
     
-    # 3. Rank Displacement Metrics
+    # 3. R-squared (coefficient of determination) on scores
+    ss_res = np.sum((gt_scores - pred_scores) ** 2)
+    ss_tot = np.sum((gt_scores - np.mean(gt_scores)) ** 2)
+    r_squared = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0.0
+
+    # 4. Rank Displacement Metrics
     # rankdata handles ties; we subtract from n to get descending rank (highest score = rank 1)
     gt_ranks = n - rankdata(gt_scores, method='average') + 1
     pred_ranks = n - rankdata(pred_scores, method='average') + 1
-    
+
     displacements = np.abs(gt_ranks - pred_ranks)
     mean_rank_error = np.mean(displacements)
     max_rank_error = np.max(displacements)
@@ -53,6 +58,7 @@ def compute_global_metrics(gt_scores: np.ndarray, pred_scores: np.ndarray):
     return {
         "kendall_tau": kendall,
         "spearman_rho": spearman,
+        "r_squared": r_squared,
         "ndcg_global": ndcg_global,
         "mean_rank_displacement": mean_rank_error,
         "max_rank_displacement": max_rank_error,
@@ -77,6 +83,7 @@ def main():
     print("="*50)
     print(f"Kendall's Tau (Pairwise) : {results['kendall_tau']:.4f}")
     print(f"Spearman's Rho (Ranks)   : {results['spearman_rho']:.4f}")
+    print(f"R-squared (Scores)       : {results['r_squared']:.4f}")
     print(f"Global NDCG (Linear)     : {results['ndcg_global']:.4f}")
     print(f"Pairwise Win Probability : {results['pairwise_accuracy']*100:.1f}%")
     print("-" * 50)
@@ -84,6 +91,7 @@ def main():
     print(f"Max Rank Displacement    : {results['max_rank_displacement']:.2f} spots")
     print("="*50)
     print("Interpretation:")
+    print(" - R-squared: Proportion of variance in ground truth explained by predictions.")
     print(" - Win Prob: Chance the model correctly picks the 'greater' of two items.")
     print(" - Displacement: Average distance between true rank and predicted rank.")
 
