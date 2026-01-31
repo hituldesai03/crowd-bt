@@ -13,12 +13,14 @@ import argparse
 import json
 import math
 import os
+import glob
 from dataclasses import dataclass, field
 from typing import List, Tuple, Dict
 
 import cv2
 import numpy as np
 import torch
+from torch.utils.data import Dataset, DataLoader
 from PIL import Image, ImageDraw, ImageFont
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
@@ -551,17 +553,15 @@ def create_stitched_overlay(
     except:
         text_width, text_height = 180, 50
 
-    # Position at center top with padding
+    # Position at center top
     text_x = (width - text_width) // 2
     text_y = 15
 
-    # Draw background rectangle
-    padding = 10
-    draw.rectangle(
-        [text_x - padding, text_y - padding,
-         text_x + text_width + padding, text_y + text_height + padding],
-        fill=(0, 0, 0, 200)
-    )
+    # Draw text outline (black) for visibility
+    for dx in [-2, -1, 0, 1, 2]:
+        for dy in [-2, -1, 0, 1, 2]:
+            if dx != 0 or dy != 0:
+                draw.text((text_x + dx, text_y + dy), final_score_text, fill=(0, 0, 0), font=font_large)
 
     # Color based on score
     if result.final_score >= 75:
@@ -795,6 +795,263 @@ def process_single_image(
     return result
 
 
+class BatchedPatchDataset(Dataset):
+    """
+    PyTorch Dataset for batched patch processing across multiple images.
+    Handles preprocessing and patch extraction on CPU workers.
+    """
+
+    def __init__(
+        self,
+        image_paths: List[str],
+        patch_size: int = 505,
+        input_size: int = 448,
+        ffc_kernel_size: int = 101,
+        ffc_method: str = 'mean',
+        ffc_clip_factor: float = 0.9
+    ):
+        self.image_paths = image_paths
+        self.patch_size = patch_size
+        self.input_size = input_size
+        self.ffc_kernel_size = ffc_kernel_size
+        self.ffc_method = ffc_method
+        self.ffc_clip_factor = ffc_clip_factor
+        self.transform = get_transforms(input_size, is_train=False)
+
+        # Build index: (image_idx, patch_idx) for each patch
+        self.patch_index = []
+        self.patches_per_image = []
+
+        for img_idx, img_path in enumerate(image_paths):
+            try:
+                img = Image.open(img_path).convert('RGB')
+                width, height = img.size
+                n_cols = width // patch_size
+                n_rows = height // patch_size
+                n_patches = n_cols * n_rows
+                self.patches_per_image.append(n_patches)
+                for patch_idx in range(n_patches):
+                    self.patch_index.append((img_idx, patch_idx))
+            except Exception as e:
+                print(f"Error indexing {img_path}: {e}")
+                self.patches_per_image.append(0)
+
+    def __len__(self):
+        return len(self.patch_index)
+
+    def __getitem__(self, idx):
+        img_idx, patch_idx = self.patch_index[idx]
+        image_path = self.image_paths[img_idx]
+
+        # Load and preprocess image
+        image = Image.open(image_path).convert('RGB')
+        image = preprocess_image_for_inference(
+            image,
+            kernel_size=self.ffc_kernel_size,
+            ffc_method=self.ffc_method,
+            clip_factor=self.ffc_clip_factor
+        )
+
+        # Extract specific patch
+        patches, patch_infos = extract_patches(image, self.patch_size)
+        patch = patches[patch_idx]
+        patch_info = patch_infos[patch_idx]
+
+        # Transform for model
+        tensor = self.transform(patch)
+
+        return {
+            'tensor': tensor,
+            'image_idx': img_idx,
+            'patch_idx': patch_idx,
+            'row': patch_info.row,
+            'col': patch_info.col,
+            'x': patch_info.x,
+            'y': patch_info.y
+        }
+
+
+def process_image_directory_batched(
+    model,
+    calibrator: ScoreCalibrator,
+    image_dir: str,
+    patch_size: int = 505,
+    lambda_param: float = 5.0,
+    input_size: int = 448,
+    device: str = "cuda",
+    output_dir: str = None,
+    save_visualizations: bool = True,
+    ffc_kernel_size: int = 101,
+    ffc_method: str = 'mean',
+    ffc_clip_factor: float = 0.9,
+    batch_size: int = 32,
+    num_workers: int = 4
+) -> List[PatchInferenceResult]:
+    """
+    Process all images in a directory with GPU-parallelized batching.
+
+    Uses DataLoader for efficient CPU preprocessing and GPU batching.
+
+    Args:
+        model: Trained QualityScorer model
+        calibrator: Fitted ScoreCalibrator
+        image_dir: Directory containing images
+        patch_size: Size of patches to extract
+        lambda_param: Defect emphasis parameter
+        input_size: Model input size
+        device: Device to run inference on
+        output_dir: Directory to save outputs
+        save_visualizations: Whether to save visualization files
+        ffc_kernel_size: Kernel size for flat field correction
+        ffc_method: FFC method ('mean', 'gaussian', 'morphology')
+        ffc_clip_factor: FFC highlight clipping factor
+        batch_size: Batch size for GPU inference
+        num_workers: Number of CPU workers for data loading
+
+    Returns:
+        List of PatchInferenceResult for all processed images
+    """
+    # Find all images
+    image_paths = []
+    for ext in ['*.png', '*.jpg', '*.jpeg', '*.PNG', '*.JPG', '*.JPEG']:
+        image_paths.extend(glob.glob(os.path.join(image_dir, ext)))
+
+    if not image_paths:
+        print(f"No images found in {image_dir}")
+        return []
+
+    image_paths = sorted(image_paths)
+    print(f"Found {len(image_paths)} images to process")
+
+    # Create dataset and dataloader
+    dataset = BatchedPatchDataset(
+        image_paths,
+        patch_size=patch_size,
+        input_size=input_size,
+        ffc_kernel_size=ffc_kernel_size,
+        ffc_method=ffc_method,
+        ffc_clip_factor=ffc_clip_factor
+    )
+
+    dataloader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True if device == "cuda" else False
+    )
+
+    print(f"Total patches to process: {len(dataset)}")
+    print(f"Batch size: {batch_size}, Workers: {num_workers}")
+
+    # Storage for all patch scores
+    # Dict: image_idx -> list of (patch_idx, row, col, x, y, raw_score)
+    image_patch_scores = {i: [] for i in range(len(image_paths))}
+
+    # Process all patches in batches
+    model.eval()
+    with torch.no_grad():
+        for batch in tqdm(dataloader, desc="Scoring patches (batched)"):
+            tensors = batch['tensor'].to(device)
+            scores = model(tensors).squeeze(-1)
+
+            # Store results
+            for i in range(len(scores)):
+                img_idx = batch['image_idx'][i].item()
+                patch_idx = batch['patch_idx'][i].item()
+                row = batch['row'][i].item()
+                col = batch['col'][i].item()
+                x = batch['x'][i].item()
+                y = batch['y'][i].item()
+                raw_score = scores[i].item()
+
+                image_patch_scores[img_idx].append({
+                    'patch_idx': patch_idx,
+                    'row': row,
+                    'col': col,
+                    'x': x,
+                    'y': y,
+                    'raw_score': raw_score
+                })
+
+    # Build results for each image
+    results = []
+    print("Aggregating results and creating visualizations...")
+
+    for img_idx, image_path in enumerate(tqdm(image_paths, desc="Finalizing")):
+        patch_data = image_patch_scores[img_idx]
+
+        if not patch_data:
+            print(f"No patches for {image_path}")
+            continue
+
+        # Sort by patch_idx to ensure correct order
+        patch_data = sorted(patch_data, key=lambda x: x['patch_idx'])
+
+        # Create PatchInfo objects
+        patch_infos = []
+        for pd in patch_data:
+            info = PatchInfo(
+                patch_id=pd['patch_idx'],
+                row=pd['row'],
+                col=pd['col'],
+                x=pd['x'],
+                y=pd['y'],
+                raw_score=pd['raw_score']
+            )
+            info.calibrated_score = calibrator.transform(pd['raw_score'])
+            patch_infos.append(info)
+
+        # Aggregate scores
+        agg_result = aggregate_scores_weighted(patch_infos, lambda_param)
+
+        # Create result object
+        result = PatchInferenceResult(
+            image_path=image_path,
+            patches=patch_infos,
+            lambda_param=lambda_param,
+            final_score=agg_result['final_score'],
+            mean_patch_score=agg_result['mean_score'],
+            min_patch_score=agg_result['min_score'],
+            max_patch_score=agg_result['max_score'],
+            std_patch_score=agg_result['std_score'],
+            weights=agg_result['weights']
+        )
+
+        # Save visualizations if requested
+        if save_visualizations and output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+            basename = os.path.splitext(os.path.basename(image_path))[0]
+
+            # Heatmap
+            heatmap_path = os.path.join(output_dir, f'{basename}_heatmap.png')
+            create_patch_heatmap(result, heatmap_path)
+
+            # Overlay
+            overlay_path = os.path.join(output_dir, f'{basename}_overlay.png')
+            create_stitched_overlay(image_path, result, overlay_path)
+
+            # Summary
+            summary_path = os.path.join(output_dir, f'{basename}_summary.png')
+            create_score_summary(result, summary_path)
+
+            # JSON result
+            json_path = os.path.join(output_dir, f'{basename}_result.json')
+            with open(json_path, 'w') as f:
+                json.dump(result.to_dict(), f, indent=2)
+
+        results.append(result)
+
+    # Save combined results
+    if output_dir and results:
+        combined_path = os.path.join(output_dir, 'all_results.json')
+        with open(combined_path, 'w') as f:
+            json.dump([r.to_dict() for r in results], f, indent=2)
+        print(f"Combined results saved to {combined_path}")
+
+    return results
+
+
 def process_image_directory(
     model,
     calibrator: ScoreCalibrator,
@@ -829,8 +1086,6 @@ def process_image_directory(
     Returns:
         List of PatchInferenceResult for all processed images
     """
-    import glob
-
     # Find all images
     image_paths = []
     for ext in ['*.png', '*.jpg', '*.jpeg', '*.PNG', '*.JPG', '*.JPEG']:
@@ -912,10 +1167,16 @@ def main():
     # Output arguments
     parser.add_argument('--output-dir', type=str, default='patch_results',
                         help='Directory to save output files')
-    parser.add_argument('--batch-size', type=int, default=9,
-                        help='Batch size for inference')
     parser.add_argument('--no-visualizations', action='store_true',
                         help='Skip generating visualization files')
+
+    # Batching arguments
+    parser.add_argument('--batched', action='store_true',
+                        help='Use GPU-parallelized batched processing (faster for many images)')
+    parser.add_argument('--batch-size', type=int, default=32,
+                        help='Batch size for GPU inference (default: 32)')
+    parser.add_argument('--num-workers', type=int, default=4,
+                        help='Number of CPU workers for data loading (default: 4)')
 
     args = parser.parse_args()
 
@@ -995,18 +1256,37 @@ def main():
     else:
         # Directory mode
         print(f"\nProcessing images from: {args.image_dir}")
-        results = process_image_directory(
-            model, calibrator, args.image_dir,
-            patch_size=args.patch_size,
-            lambda_param=args.lambda_param,
-            input_size=input_size,
-            device=device,
-            output_dir=args.output_dir,
-            save_visualizations=save_viz,
-            ffc_kernel_size=args.ffc_kernel_size,
-            ffc_method=args.ffc_method,
-            ffc_clip_factor=args.ffc_clip_factor
-        )
+
+        if args.batched:
+            print(f"Using GPU-parallelized batched processing")
+            print(f"Batch size: {args.batch_size}, Workers: {args.num_workers}")
+            results = process_image_directory_batched(
+                model, calibrator, args.image_dir,
+                patch_size=args.patch_size,
+                lambda_param=args.lambda_param,
+                input_size=input_size,
+                device=device,
+                output_dir=args.output_dir,
+                save_visualizations=save_viz,
+                ffc_kernel_size=args.ffc_kernel_size,
+                ffc_method=args.ffc_method,
+                ffc_clip_factor=args.ffc_clip_factor,
+                batch_size=args.batch_size,
+                num_workers=args.num_workers
+            )
+        else:
+            results = process_image_directory(
+                model, calibrator, args.image_dir,
+                patch_size=args.patch_size,
+                lambda_param=args.lambda_param,
+                input_size=input_size,
+                device=device,
+                output_dir=args.output_dir,
+                save_visualizations=save_viz,
+                ffc_kernel_size=args.ffc_kernel_size,
+                ffc_method=args.ffc_method,
+                ffc_clip_factor=args.ffc_clip_factor
+            )
 
         # Print summary
         if results:
