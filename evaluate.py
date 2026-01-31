@@ -20,6 +20,44 @@ from dataset import get_transforms
 from data_loader import load_local_comparisons
 
 
+def load_prepared_data_comparisons(
+    prepared_data_dir: str,
+    split: str = "val"
+) -> List[Dict]:
+    """
+    Load comparisons from a prepared data directory (e.g., training_data_120k).
+
+    Args:
+        prepared_data_dir: Path to directory containing train_comparisons.json,
+                          val_comparisons.json, all_comparisons.json
+        split: Which split to load - "train", "val", or "all"
+
+    Returns:
+        List of comparison dicts with keys: img1, img2, label, weight,
+        annotator_id, annotator_reliability, pair_type, img1_category, img2_category
+    """
+    split_files = {
+        "train": "train_comparisons.json",
+        "val": "val_comparisons.json",
+        "all": "all_comparisons.json"
+    }
+
+    if split not in split_files:
+        raise ValueError(f"Invalid split '{split}'. Must be one of: {list(split_files.keys())}")
+
+    json_path = os.path.join(prepared_data_dir, split_files[split])
+
+    if not os.path.exists(json_path):
+        print(f"Warning: {json_path} not found")
+        return []
+
+    with open(json_path, 'r') as f:
+        comparisons = json.load(f)
+
+    print(f"Loaded {len(comparisons)} comparisons from {json_path}")
+    return comparisons
+
+
 @torch.no_grad()
 def evaluate_pairwise_accuracy(
     model: QualityScorer,
@@ -314,7 +352,7 @@ def print_evaluation_report(results: Dict) -> None:
             acc = metrics['accuracy'] * 100
             margin = metrics.get('mean_score_margin', 0)
             print(f"  {pair_type:20s}: {acc:5.1f}% "
-                  f"({metrics['correct']:3d}/{metrics['total']:3d}) "
+                  f"({metrics['correct']:6d}/{metrics['total']:6d}) "
                   f"margin={margin:.3f}")
 
     print("\n" + "=" * 60)
@@ -340,6 +378,14 @@ def main():
                         default='/home/hitul/Desktop/quality-comparison-toolkit/data',
                         help='Directory containing comparison JSON files')
 
+    # Prepared data format (e.g., training_data_120k)
+    parser.add_argument('--prepared-data-dir', type=str, default=None,
+                        help='Path to prepared data directory (e.g., training_data_120k) '
+                             'containing train_comparisons.json, val_comparisons.json, etc.')
+    parser.add_argument('--split', type=str, default='val',
+                        choices=['train', 'val', 'all'],
+                        help='Which split to evaluate when using --prepared-data-dir')
+
     # Output
     parser.add_argument('--output', type=str, default=None,
                         help='Output JSON file for results')
@@ -356,7 +402,7 @@ def main():
     print(f"Loading model from {args.checkpoint}")
 
     # Try to read backbone from checkpoint
-    checkpoint = torch.load(args.checkpoint, map_location=device)
+    checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
     if 'config' in checkpoint:
         backbone = checkpoint['config'].get('backbone_name', args.backbone)
         input_size = checkpoint['config'].get('input_size', args.input_size)
@@ -367,14 +413,51 @@ def main():
     model = load_model(args.checkpoint, backbone_name=backbone, device=device)
     print(f"Model loaded: {backbone}, input size: {input_size}")
 
-    # Create config
-    config = Config()
-    config.data.image_dir = args.image_dir
-    config.data.local_data_dir = args.data_dir
-    config.training.input_size = input_size
+    # Load comparisons based on data source
+    if args.prepared_data_dir:
+        # Load from prepared data directory (training_data_120k format)
+        comparisons = load_prepared_data_comparisons(
+            args.prepared_data_dir,
+            split=args.split
+        )
+        image_dir = args.image_dir
+    else:
+        # Load from legacy data directory
+        comparisons = load_local_comparisons(data_dir=args.data_dir)
+        image_dir = args.image_dir
+
+    if not comparisons:
+        print("No comparisons found for evaluation")
+        return
+
+    print(f"\nTotal comparisons: {len(comparisons)}")
+    print(f"Image directory: {image_dir}")
 
     # Run evaluation
-    results = full_evaluation(model, config, device=device)
+    print("\n=== Evaluating by Pair Type ===")
+    pair_type_results = evaluate_by_pair_type(
+        model, comparisons, image_dir, input_size, device
+    )
+
+    # Compile results
+    results = {'accuracy_by_pair_type': pair_type_results}
+
+    # Compute overall accuracy
+    total_correct = sum(r['correct'] for r in pair_type_results.values())
+    total_pairs = sum(r['total'] for r in pair_type_results.values())
+    results['overall_accuracy'] = total_correct / total_pairs if total_pairs > 0 else 0.0
+    results['overall_correct'] = total_correct
+    results['overall_total'] = total_pairs
+
+    # Gold-gold accuracy
+    if 'gold_gold' in pair_type_results:
+        results['gold_accuracy'] = pair_type_results['gold_gold']['accuracy']
+        results['gold_correct'] = pair_type_results['gold_gold']['correct']
+        results['gold_total'] = pair_type_results['gold_gold']['total']
+    else:
+        results['gold_accuracy'] = None
+        results['gold_correct'] = 0
+        results['gold_total'] = 0
 
     # Print report
     print_evaluation_report(results)
