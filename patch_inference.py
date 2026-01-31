@@ -534,6 +534,47 @@ def create_stitched_overlay(
         # Draw the white score text
         draw.text((text_x, text_y), score_text, fill=(255, 255, 255), font=font)
 
+    # Draw aggregated final score at center top
+    try:
+        font_large = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 48)
+    except:
+        try:
+            font_large = ImageFont.truetype("/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf", 48)
+        except:
+            font_large = font
+
+    final_score_text = f"Score: {result.final_score:.1f}"
+    try:
+        bbox = draw.textbbox((0, 0), final_score_text, font=font_large)
+        text_width = bbox[2] - bbox[0]
+        text_height = bbox[3] - bbox[1]
+    except:
+        text_width, text_height = 180, 50
+
+    # Position at center top with padding
+    text_x = (width - text_width) // 2
+    text_y = 15
+
+    # Draw background rectangle
+    padding = 10
+    draw.rectangle(
+        [text_x - padding, text_y - padding,
+         text_x + text_width + padding, text_y + text_height + padding],
+        fill=(0, 0, 0, 200)
+    )
+
+    # Color based on score
+    if result.final_score >= 75:
+        score_color = (0, 255, 0)  # Green
+    elif result.final_score >= 50:
+        score_color = (255, 255, 0)  # Yellow
+    elif result.final_score >= 25:
+        score_color = (255, 165, 0)  # Orange
+    else:
+        score_color = (255, 0, 0)  # Red
+
+    draw.text((text_x, text_y), final_score_text, fill=score_color, font=font_large)
+
     img.save(output_path)
 
 
