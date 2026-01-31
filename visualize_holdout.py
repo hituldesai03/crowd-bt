@@ -1,8 +1,8 @@
 """
-Inference and visualization script for holdout set.
+Inference and visualization script for image directories.
 
-Loads holdout images, runs model inference, and creates visualizations
-with predicted quality scores overlaid on each patch.
+Loads images from a directory, runs model inference, and creates visualizations
+with predicted quality scores overlaid on each image.
 """
 
 import argparse
@@ -21,31 +21,26 @@ from model import load_model
 from infer import score_single_image
 
 
-def load_holdout_images(holdout_file: str, image_dir: str) -> List[str]:
+def load_images_from_directory(image_dir: str) -> List[str]:
     """
-    Load list of holdout images.
+    Load all images from a directory.
 
     Args:
-        holdout_file: Path to holdout.txt
         image_dir: Directory containing images
 
     Returns:
         List of full image paths
     """
-    with open(holdout_file, 'r') as f:
-        filenames = [line.strip() for line in f if line.strip()]
+    import glob
 
-    # Convert to full paths
-    image_paths = [os.path.join(image_dir, fname) for fname in filenames]
+    image_paths = []
+    for ext in ['*.png', '*.jpg', '*.jpeg', '*.PNG', '*.JPG', '*.JPEG']:
+        image_paths.extend(glob.glob(os.path.join(image_dir, ext)))
 
-    # Filter to only existing files
-    existing_paths = [p for p in image_paths if os.path.exists(p)]
+    # Sort for consistent ordering
+    image_paths = sorted(image_paths)
 
-    if len(existing_paths) < len(image_paths):
-        missing = len(image_paths) - len(existing_paths)
-        print(f"Warning: {missing} images not found")
-
-    return existing_paths
+    return image_paths
 
 
 def create_annotated_image(
@@ -141,7 +136,7 @@ def score_and_visualize_holdout(
 
     results = []
 
-    print(f"Scoring {len(holdout_images)} holdout images...")
+    print(f"Scoring {len(holdout_images)} images...")
     for img_path in tqdm(holdout_images):
         try:
             # Score image
@@ -202,7 +197,7 @@ def create_summary_visualization(
     if n_rows == 1:
         axes = axes.reshape(1, -1)
 
-    fig.suptitle('Holdout Set: Patches Ranked by Predicted Quality (High → Low)',
+    fig.suptitle('Images Ranked by Predicted Quality (High → Low)',
                  fontsize=16, fontweight='bold')
 
     for idx, result in enumerate(display_results):
@@ -279,7 +274,7 @@ def create_score_distribution_plot(
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Visualize holdout set with predicted quality scores'
+        description='Visualize images with predicted quality scores'
     )
 
     # Model args
@@ -293,12 +288,8 @@ def main():
                         help='Device (cuda or cpu)')
 
     # Data args
-    parser.add_argument('--holdout-file', type=str,
-                        default='/home/hitul/Desktop/quality-comparison-toolkit/data/holdout.txt',
-                        help='Path to holdout.txt')
-    parser.add_argument('--image-dir', type=str,
-                        default='/home/hitul/Desktop/quality-comparison-toolkit/data/iter_0',
-                        help='Directory containing images')
+    parser.add_argument('--image-dir', type=str, required=True,
+                        help='Directory containing images to visualize')
 
     # Output args
     parser.add_argument('--output-dir', type=str, default='holdout_visualizations',
@@ -323,7 +314,7 @@ def main():
         device = "cpu"
 
     print("="*60)
-    print("Holdout Set Visualization")
+    print("Image Quality Visualization")
     print("="*60)
 
     # Load model
@@ -343,9 +334,9 @@ def main():
     model = load_model(args.checkpoint, backbone_name=backbone, device=device)
     print(f"Model loaded: {backbone}, input size: {input_size}")
 
-    # Load holdout images
-    print(f"\nLoading holdout images from {args.holdout_file}")
-    holdout_images = load_holdout_images(args.holdout_file, args.image_dir)
+    # Load images from directory
+    print(f"\nLoading images from {args.image_dir}")
+    holdout_images = load_images_from_directory(args.image_dir)
     print(f"Found {len(holdout_images)} images")
 
     # Score and create individual visualizations

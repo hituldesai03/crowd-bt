@@ -1,8 +1,8 @@
 """
-Inference and visualization script for holdout set with CALIBRATED 0-100 scores.
+Inference and visualization script with CALIBRATED 0-100 scores.
 
-Loads holdout images, runs model inference, calibrates scores to 0-100 range,
-and creates visualizations with calibrated quality scores overlaid on each patch.
+Loads images from a directory, runs model inference, calibrates scores to 0-100 range,
+and creates visualizations with calibrated quality scores overlaid on each image.
 """
 
 import argparse
@@ -20,19 +20,15 @@ from infer import score_single_image
 from calibrate_scores import ScoreCalibrator
 
 
-def load_holdout_images(holdout_file: str, image_dir: str) -> List[str]:
-    """Load list of holdout images."""
-    with open(holdout_file, 'r') as f:
-        filenames = [line.strip() for line in f if line.strip()]
+def load_images_from_directory(image_dir: str) -> List[str]:
+    """Load all images from a directory."""
+    import glob
 
-    image_paths = [os.path.join(image_dir, fname) for fname in filenames]
-    existing_paths = [p for p in image_paths if os.path.exists(p)]
+    image_paths = []
+    for ext in ['*.png', '*.jpg', '*.jpeg', '*.PNG', '*.JPG', '*.JPEG']:
+        image_paths.extend(glob.glob(os.path.join(image_dir, ext)))
 
-    if len(existing_paths) < len(image_paths):
-        missing = len(image_paths) - len(existing_paths)
-        print(f"Warning: {missing} images not found")
-
-    return existing_paths
+    return sorted(image_paths)
 
 
 def create_annotated_image_calibrated(
@@ -131,7 +127,7 @@ def score_and_visualize_holdout_calibrated(
 
     results = []
 
-    print(f"Scoring {len(holdout_images)} holdout images...")
+    print(f"Scoring {len(holdout_images)} images...")
     for img_path in tqdm(holdout_images):
         try:
             # Score image (raw)
@@ -190,7 +186,7 @@ def create_summary_visualization_calibrated(
     if n_rows == 1:
         axes = axes.reshape(1, -1)
 
-    fig.suptitle('Holdout Set: Patches Ranked by Quality Score (0-100 scale, High → Low)',
+    fig.suptitle('Images Ranked by Quality Score (0-100 scale, High → Low)',
                  fontsize=16, fontweight='bold')
 
     for idx, result in enumerate(display_results):
@@ -286,7 +282,7 @@ def create_score_distribution_plot_calibrated(
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Visualize holdout set with calibrated 0-100 quality scores'
+        description='Visualize images with calibrated 0-100 quality scores'
     )
 
     # Model args
@@ -302,12 +298,8 @@ def main():
                         help='Device (cuda or cpu)')
 
     # Data args
-    parser.add_argument('--holdout-file', type=str,
-                        default='/home/hitul/Desktop/quality-comparison-toolkit/data/holdout.txt',
-                        help='Path to holdout.txt')
-    parser.add_argument('--image-dir', type=str,
-                        default='/home/hitul/Desktop/quality-comparison-toolkit/data/iter_0',
-                        help='Directory containing images')
+    parser.add_argument('--image-dir', type=str, required=True,
+                        help='Directory containing images to visualize')
 
     # Output args
     parser.add_argument('--output-dir', type=str, default='holdout_visualizations_calibrated',
@@ -326,7 +318,7 @@ def main():
         device = "cpu"
 
     print("="*60)
-    print("Holdout Set Visualization (Calibrated 0-100)")
+    print("Image Quality Visualization (Calibrated 0-100)")
     print("="*60)
 
     # Load model
@@ -350,9 +342,9 @@ def main():
     print(f"\nLoading calibrator from {args.calibrator}")
     calibrator = ScoreCalibrator.load(args.calibrator)
 
-    # Load holdout images
-    print(f"\nLoading holdout images from {args.holdout_file}")
-    holdout_images = load_holdout_images(args.holdout_file, args.image_dir)
+    # Load images from directory
+    print(f"\nLoading images from {args.image_dir}")
+    holdout_images = load_images_from_directory(args.image_dir)
     print(f"Found {len(holdout_images)} images")
 
     # Score and create visualizations
