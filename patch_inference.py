@@ -456,21 +456,18 @@ def create_stitched_overlay(
     alpha: float = 0.3
 ):
     """
-    Create original image with semi-transparent color overlay per patch.
+    Create original image with white grid segments and bold white scores.
 
     Args:
         image_path: Path to original image
         result: PatchInferenceResult with patch scores
         output_path: Path to save overlay image
-        alpha: Transparency level (0-1) for overlay
+        alpha: Transparency level (unused, kept for API compatibility)
     """
     # Load original image
-    img = Image.open(image_path).convert('RGBA')
+    img = Image.open(image_path).convert('RGB')
     width, height = img.size
-
-    # Create overlay layer
-    overlay = Image.new('RGBA', (width, height), (0, 0, 0, 0))
-    draw_overlay = ImageDraw.Draw(overlay)
+    draw = ImageDraw.Draw(img)
 
     # Determine patch size from result
     if len(result.patches) > 1:
@@ -496,93 +493,48 @@ def create_stitched_overlay(
     else:
         patch_width = patch_height = 505
 
-    # Draw colored rectangles for each patch
-    for patch in result.patches:
-        color = get_quality_color(patch.calibrated_score)
-        # Calculate alpha value (0-255)
-        alpha_int = int(alpha * 255)
-
-        x1 = patch.x
-        y1 = patch.y
-        x2 = min(patch.x + patch_width, width)
-        y2 = min(patch.y + patch_height, height)
-
-        draw_overlay.rectangle(
-            [x1, y1, x2, y2],
-            fill=(*color, alpha_int)
-        )
-
-    # Composite overlay onto original
-    img_with_overlay = Image.alpha_composite(img, overlay)
-
-    # Convert back to RGB for drawing text
-    img_rgb = img_with_overlay.convert('RGB')
-    draw = ImageDraw.Draw(img_rgb)
-
-    # Load font
+    # Load font - use larger bold font for scores
     try:
-        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 24)
-        font_large = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 36)
+        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 36)
     except:
         try:
-            font = ImageFont.truetype("/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf", 24)
-            font_large = ImageFont.truetype("/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf", 36)
+            font = ImageFont.truetype("/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf", 36)
         except:
             font = ImageFont.load_default()
-            font_large = font
 
-    # Draw grid lines
+    # Draw white grid lines and scores for each patch
     for patch in result.patches:
         x1 = patch.x
         y1 = patch.y
         x2 = min(patch.x + patch_width, width)
         y2 = min(patch.y + patch_height, height)
 
-        # Draw rectangle outline
-        draw.rectangle([x1, y1, x2, y2], outline=(255, 255, 255), width=2)
+        # Draw white rectangle outline (grid segment)
+        draw.rectangle([x1, y1, x2, y2], outline=(255, 255, 255), width=3)
 
-        # Draw score text in center of patch
+        # Draw bold white score text in center of patch (no background)
         score_text = f'{patch.calibrated_score:.1f}'
         try:
             bbox = draw.textbbox((0, 0), score_text, font=font)
             text_width = bbox[2] - bbox[0]
             text_height = bbox[3] - bbox[1]
         except:
-            text_width, text_height = 50, 20
+            text_width, text_height = 60, 30
 
         text_x = x1 + (x2 - x1 - text_width) // 2
         text_y = y1 + (y2 - y1 - text_height) // 2
 
-        # Draw text with background
-        padding = 5
-        draw.rectangle(
-            [text_x - padding, text_y - padding, text_x + text_width + padding, text_y + text_height + padding],
-            fill=(0, 0, 0, 200)
-        )
+        # Draw text outline (black) for visibility, then white text on top
+        outline_color = (0, 0, 0)
+        for dx in [-2, -1, 0, 1, 2]:
+            for dy in [-2, -1, 0, 1, 2]:
+                if dx != 0 or dy != 0:
+                    draw.text((text_x + dx, text_y + dy), score_text, fill=outline_color, font=font)
+
+        # Draw the white score text
         draw.text((text_x, text_y), score_text, fill=(255, 255, 255), font=font)
 
-    # Draw final score banner at top
-    tier = get_quality_tier(result.final_score)
-    banner_text = f'Final Score: {result.final_score:.1f} ({tier})'
-    try:
-        bbox = draw.textbbox((0, 0), banner_text, font=font_large)
-        banner_width = bbox[2] - bbox[0]
-        banner_height = bbox[3] - bbox[1]
-    except:
-        banner_width, banner_height = 300, 40
-
-    banner_x = (width - banner_width) // 2
-    banner_y = 10
-
-    # Banner background
-    color = get_quality_color(result.final_score)
-    draw.rectangle(
-        [banner_x - 15, banner_y - 5, banner_x + banner_width + 15, banner_y + banner_height + 10],
-        fill=(*color, 230)
-    )
-    draw.text((banner_x, banner_y), banner_text, fill=(255, 255, 255), font=font_large)
-
-    img_rgb.save(output_path)
+    img.save(output_path)
 
 
 def create_score_summary(
