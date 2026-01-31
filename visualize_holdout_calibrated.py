@@ -3,32 +3,159 @@ Inference and visualization script with CALIBRATED 0-100 scores.
 
 Loads images from a directory, runs model inference, calibrates scores to 0-100 range,
 and creates visualizations with calibrated quality scores overlaid on each image.
+
+Supports GPU batching and CPU multiprocessing for faster processing.
 """
 
 import argparse
 import os
+import glob
 import json
 import numpy as np
 import torch
+from torch.utils.data import Dataset, DataLoader
 from PIL import Image, ImageDraw, ImageFont
 from tqdm import tqdm
 from typing import List, Dict
 import matplotlib.pyplot as plt
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import multiprocessing as mp
 
 from model import load_model
 from infer import score_single_image
 from calibrate_scores import ScoreCalibrator
+from dataset import get_transforms
 
 
 def load_images_from_directory(image_dir: str) -> List[str]:
     """Load all images from a directory."""
-    import glob
-
     image_paths = []
     for ext in ['*.png', '*.jpg', '*.jpeg', '*.PNG', '*.JPG', '*.JPEG']:
         image_paths.extend(glob.glob(os.path.join(image_dir, ext)))
 
     return sorted(image_paths)
+
+
+class ImageDataset(Dataset):
+    """PyTorch Dataset for batched image scoring."""
+
+    def __init__(self, image_paths: List[str], input_size: int = 448):
+        self.image_paths = image_paths
+        self.input_size = input_size
+        self.transform = get_transforms(input_size, is_train=False)
+
+    def __len__(self):
+        return len(self.image_paths)
+
+    def __getitem__(self, idx):
+        img_path = self.image_paths[idx]
+        image = Image.open(img_path).convert('RGB')
+        tensor = self.transform(image)
+        return {'tensor': tensor, 'path': img_path, 'idx': idx}
+
+
+def score_images_batched(
+    model,
+    image_paths: List[str],
+    input_size: int = 448,
+    device: str = "cuda",
+    batch_size: int = 32,
+    num_workers: int = 4
+) -> List[Dict]:
+    """Score images using GPU batching."""
+    dataset = ImageDataset(image_paths, input_size)
+    dataloader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True if device == "cuda" else False
+    )
+
+    results = [None] * len(image_paths)
+
+    model.eval()
+    with torch.no_grad():
+        for batch in tqdm(dataloader, desc="Scoring images (batched)"):
+            tensors = batch['tensor'].to(device)
+            paths = batch['path']
+            indices = batch['idx']
+
+            scores = model(tensors).squeeze(-1)
+
+            for i in range(len(scores)):
+                idx = indices[i].item()
+                results[idx] = {
+                    'path': paths[i],
+                    'raw_score': scores[i].item(),
+                    'idx': idx
+                }
+
+    return results
+
+
+def create_annotated_image_calibrated_worker(args):
+    """Worker function for multiprocessing visualization creation."""
+    image_path, raw_score, calibrated_score, output_path, font_size, show_raw = args
+
+    try:
+        img = Image.open(image_path).convert('RGB')
+        draw = ImageDraw.Draw(img)
+
+        # Load font
+        try:
+            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", font_size)
+            font_small = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", int(font_size * 0.6))
+        except:
+            try:
+                font = ImageFont.truetype("/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf", font_size)
+                font_small = ImageFont.load_default()
+            except:
+                font = ImageFont.load_default()
+                font_small = font
+
+        score_text = f"{calibrated_score:.1f}"
+
+        try:
+            bbox = draw.textbbox((0, 0), score_text, font=font)
+            text_width = bbox[2] - bbox[0]
+            text_height = bbox[3] - bbox[1]
+        except:
+            text_width, text_height = 80, 40
+
+        padding = 10
+        x = padding
+        y = padding
+
+        bg_height = text_height + 10
+        if show_raw:
+            bg_height += int(font_size * 0.6) + 5
+
+        draw.rectangle(
+            [x - 5, y - 5, x + text_width + 5, y + bg_height],
+            fill=(0, 0, 0, 200)
+        )
+
+        # Color based on calibrated score
+        if calibrated_score >= 75:
+            text_color = (0, 255, 0)
+        elif calibrated_score >= 50:
+            text_color = (255, 255, 0)
+        elif calibrated_score >= 25:
+            text_color = (255, 165, 0)
+        else:
+            text_color = (255, 0, 0)
+
+        draw.text((x, y), score_text, fill=text_color, font=font)
+
+        if show_raw:
+            raw_text = f"({raw_score:.2f})"
+            draw.text((x, y + text_height + 5), raw_text, fill=(200, 200, 200), font=font_small)
+
+        img.save(output_path)
+        return {'success': True, 'path': output_path}
+    except Exception as e:
+        return {'success': False, 'path': output_path, 'error': str(e)}
 
 
 def create_annotated_image_calibrated(
@@ -122,7 +249,7 @@ def score_and_visualize_holdout_calibrated(
     device: str = "cuda",
     show_raw: bool = False
 ) -> List[Dict]:
-    """Score all holdout images with calibrated scores and create visualizations."""
+    """Score all holdout images with calibrated scores and create visualizations (sequential)."""
     os.makedirs(output_dir, exist_ok=True)
 
     results = []
@@ -165,6 +292,95 @@ def score_and_visualize_holdout_calibrated(
             })
 
     return results
+
+
+def score_and_visualize_calibrated_batched(
+    model,
+    calibrator: ScoreCalibrator,
+    image_paths: List[str],
+    output_dir: str,
+    input_size: int = 448,
+    device: str = "cuda",
+    show_raw: bool = False,
+    batch_size: int = 32,
+    num_workers: int = 4,
+    viz_workers: int = None,
+    font_size: int = 40
+) -> List[Dict]:
+    """
+    Score images with GPU batching, calibrate, and create visualizations with CPU multiprocessing.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+
+    if viz_workers is None:
+        viz_workers = min(mp.cpu_count(), 8)
+
+    # Step 1: Score all images with GPU batching
+    print(f"Scoring {len(image_paths)} images with GPU batching...")
+    print(f"  Batch size: {batch_size}, Data workers: {num_workers}")
+
+    score_results = score_images_batched(
+        model, image_paths, input_size, device, batch_size, num_workers
+    )
+
+    # Step 2: Calibrate scores and prepare visualization tasks
+    print(f"\nCalibrating scores and creating visualizations with {viz_workers} CPU workers...")
+
+    viz_tasks = []
+    for result in score_results:
+        if result is not None and result.get('raw_score') is not None:
+            raw_score = result['raw_score']
+            calibrated_score = calibrator.transform(raw_score)
+            basename = os.path.basename(result['path'])
+            output_path = os.path.join(output_dir, basename)
+            viz_tasks.append((
+                result['path'],
+                raw_score,
+                calibrated_score,
+                output_path,
+                font_size,
+                show_raw
+            ))
+
+    # Use multiprocessing for visualization creation
+    viz_results = {}
+    with ProcessPoolExecutor(max_workers=viz_workers) as executor:
+        futures = {executor.submit(create_annotated_image_calibrated_worker, task): task[0]
+                   for task in viz_tasks}
+
+        for future in tqdm(as_completed(futures), total=len(futures), desc="Creating visualizations"):
+            img_path = futures[future]
+            try:
+                viz_results[img_path] = future.result()
+            except Exception as e:
+                viz_results[img_path] = {'success': False, 'error': str(e)}
+
+    # Combine results
+    final_results = []
+    for result in score_results:
+        if result is None:
+            continue
+
+        img_path = result['path']
+        basename = os.path.basename(img_path)
+        output_path = os.path.join(output_dir, basename)
+        raw_score = result.get('raw_score')
+
+        final_result = {
+            'path': img_path,
+            'filename': basename,
+            'raw_score': raw_score,
+            'calibrated_score': calibrator.transform(raw_score) if raw_score is not None else None,
+            'output_path': output_path
+        }
+
+        viz_result = viz_results.get(img_path, {})
+        if not viz_result.get('success', True):
+            final_result['viz_error'] = viz_result.get('error', 'Unknown error')
+
+        final_results.append(final_result)
+
+    return final_results
 
 
 def create_summary_visualization_calibrated(
@@ -308,6 +524,18 @@ def main():
                         help='Show raw scores alongside calibrated scores')
     parser.add_argument('--max-grid-images', type=int, default=100,
                         help='Maximum images in summary grid')
+    parser.add_argument('--font-size', type=int, default=40,
+                        help='Font size for score overlay')
+
+    # Batching args
+    parser.add_argument('--batched', action='store_true',
+                        help='Use GPU batching and CPU multiprocessing (faster)')
+    parser.add_argument('--batch-size', type=int, default=32,
+                        help='Batch size for GPU inference (default: 32)')
+    parser.add_argument('--num-workers', type=int, default=4,
+                        help='Workers for data loading (default: 4)')
+    parser.add_argument('--viz-workers', type=int, default=None,
+                        help='Workers for visualization creation (default: CPU count)')
 
     args = parser.parse_args()
 
@@ -349,15 +577,32 @@ def main():
 
     # Score and create visualizations
     print(f"\nCreating annotated images in {args.output_dir}")
-    results = score_and_visualize_holdout_calibrated(
-        model,
-        calibrator,
-        holdout_images,
-        args.output_dir,
-        input_size=input_size,
-        device=device,
-        show_raw=args.show_raw
-    )
+
+    if args.batched:
+        print("Using GPU batching and CPU multiprocessing")
+        results = score_and_visualize_calibrated_batched(
+            model,
+            calibrator,
+            holdout_images,
+            args.output_dir,
+            input_size=input_size,
+            device=device,
+            show_raw=args.show_raw,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            viz_workers=args.viz_workers,
+            font_size=args.font_size
+        )
+    else:
+        results = score_and_visualize_holdout_calibrated(
+            model,
+            calibrator,
+            holdout_images,
+            args.output_dir,
+            input_size=input_size,
+            device=device,
+            show_raw=args.show_raw
+        )
 
     # Save results
     results_json_path = os.path.join(args.output_dir, 'scores_calibrated.json')

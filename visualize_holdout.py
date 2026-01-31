@@ -3,22 +3,29 @@ Inference and visualization script for image directories.
 
 Loads images from a directory, runs model inference, and creates visualizations
 with predicted quality scores overlaid on each image.
+
+Supports GPU batching and CPU multiprocessing for faster processing.
 """
 
 import argparse
 import os
+import glob
 import json
 import numpy as np
 import torch
+from torch.utils.data import Dataset, DataLoader
 from PIL import Image, ImageDraw, ImageFont
 from tqdm import tqdm
 from typing import List, Dict, Tuple
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 from pathlib import Path
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import multiprocessing as mp
 
 from model import load_model
 from infer import score_single_image
+from dataset import get_transforms
 
 
 def load_images_from_directory(image_dir: str) -> List[str]:
@@ -31,8 +38,6 @@ def load_images_from_directory(image_dir: str) -> List[str]:
     Returns:
         List of full image paths
     """
-    import glob
-
     image_paths = []
     for ext in ['*.png', '*.jpg', '*.jpeg', '*.PNG', '*.JPG', '*.JPEG']:
         image_paths.extend(glob.glob(os.path.join(image_dir, ext)))
@@ -41,6 +46,134 @@ def load_images_from_directory(image_dir: str) -> List[str]:
     image_paths = sorted(image_paths)
 
     return image_paths
+
+
+class ImageDataset(Dataset):
+    """PyTorch Dataset for batched image scoring."""
+
+    def __init__(self, image_paths: List[str], input_size: int = 448):
+        self.image_paths = image_paths
+        self.input_size = input_size
+        self.transform = get_transforms(input_size, is_train=False)
+
+    def __len__(self):
+        return len(self.image_paths)
+
+    def __getitem__(self, idx):
+        img_path = self.image_paths[idx]
+        image = Image.open(img_path).convert('RGB')
+        tensor = self.transform(image)
+        return {'tensor': tensor, 'path': img_path, 'idx': idx}
+
+
+def score_images_batched(
+    model,
+    image_paths: List[str],
+    input_size: int = 448,
+    device: str = "cuda",
+    batch_size: int = 32,
+    num_workers: int = 4
+) -> List[Dict]:
+    """
+    Score images using GPU batching.
+
+    Args:
+        model: Trained model
+        image_paths: List of image paths
+        input_size: Model input size
+        device: Device for inference
+        batch_size: Batch size for GPU
+        num_workers: Number of data loading workers
+
+    Returns:
+        List of dicts with 'path', 'score', 'idx'
+    """
+    dataset = ImageDataset(image_paths, input_size)
+    dataloader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True if device == "cuda" else False
+    )
+
+    results = [None] * len(image_paths)
+
+    model.eval()
+    with torch.no_grad():
+        for batch in tqdm(dataloader, desc="Scoring images (batched)"):
+            tensors = batch['tensor'].to(device)
+            paths = batch['path']
+            indices = batch['idx']
+
+            scores = model(tensors).squeeze(-1)
+
+            for i in range(len(scores)):
+                idx = indices[i].item()
+                results[idx] = {
+                    'path': paths[i],
+                    'score': scores[i].item(),
+                    'idx': idx
+                }
+
+    return results
+
+
+def create_annotated_image_worker(args):
+    """Worker function for multiprocessing visualization creation."""
+    image_path, score, output_path, font_size, score_format = args
+
+    try:
+        img = Image.open(image_path).convert('RGB')
+        draw = ImageDraw.Draw(img)
+
+        # Load font
+        try:
+            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", font_size)
+        except:
+            try:
+                font = ImageFont.truetype("/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf", font_size)
+            except:
+                font = ImageFont.load_default()
+
+        score_text = score_format.format(score)
+
+        try:
+            bbox = draw.textbbox((0, 0), score_text, font=font)
+            text_width = bbox[2] - bbox[0]
+            text_height = bbox[3] - bbox[1]
+        except:
+            text_width, text_height = 80, 40
+
+        padding = 10
+        x = padding
+        y = padding
+
+        # Background rectangle
+        draw.rectangle(
+            [x - 5, y - 5, x + text_width + 5, y + text_height + 5],
+            fill=(0, 0, 0, 200)
+        )
+
+        # Color based on score
+        normalized = (score + 2) / 4
+        normalized = max(0, min(1, normalized))
+
+        if normalized < 0.5:
+            r = 255
+            g = int(255 * (normalized * 2))
+        else:
+            r = int(255 * (1 - (normalized - 0.5) * 2))
+            g = 255
+        b = 0
+        text_color = (r, g, b)
+
+        draw.text((x, y), score_text, fill=text_color, font=font)
+        img.save(output_path)
+
+        return {'success': True, 'path': output_path}
+    except Exception as e:
+        return {'success': False, 'path': output_path, 'error': str(e)}
 
 
 def create_annotated_image(
@@ -127,7 +260,7 @@ def score_and_visualize_holdout(
     device: str = "cuda"
 ) -> List[Dict]:
     """
-    Score all holdout images and create visualizations.
+    Score all holdout images and create visualizations (sequential).
 
     Returns:
         List of dicts with 'path', 'score', 'output_path'
@@ -166,6 +299,104 @@ def score_and_visualize_holdout(
             })
 
     return results
+
+
+def score_and_visualize_batched(
+    model,
+    image_paths: List[str],
+    output_dir: str,
+    input_size: int = 448,
+    device: str = "cuda",
+    batch_size: int = 32,
+    num_workers: int = 4,
+    viz_workers: int = None,
+    font_size: int = 40,
+    score_format: str = "{:.3f}"
+) -> List[Dict]:
+    """
+    Score images with GPU batching and create visualizations with CPU multiprocessing.
+
+    Args:
+        model: Trained model
+        image_paths: List of image paths
+        output_dir: Output directory for visualizations
+        input_size: Model input size
+        device: Device for inference
+        batch_size: Batch size for GPU inference
+        num_workers: Workers for data loading
+        viz_workers: Workers for visualization creation (default: CPU count)
+        font_size: Font size for score overlay
+        score_format: Format string for scores
+
+    Returns:
+        List of result dicts
+    """
+    os.makedirs(output_dir, exist_ok=True)
+
+    if viz_workers is None:
+        viz_workers = min(mp.cpu_count(), 8)
+
+    # Step 1: Score all images with GPU batching
+    print(f"Scoring {len(image_paths)} images with GPU batching...")
+    print(f"  Batch size: {batch_size}, Data workers: {num_workers}")
+
+    score_results = score_images_batched(
+        model, image_paths, input_size, device, batch_size, num_workers
+    )
+
+    # Step 2: Create visualizations with CPU multiprocessing
+    print(f"\nCreating visualizations with {viz_workers} CPU workers...")
+
+    viz_tasks = []
+    for result in score_results:
+        if result is not None and result.get('score') is not None:
+            basename = os.path.basename(result['path'])
+            output_path = os.path.join(output_dir, basename)
+            viz_tasks.append((
+                result['path'],
+                result['score'],
+                output_path,
+                font_size,
+                score_format
+            ))
+
+    # Use multiprocessing for visualization creation
+    viz_results = {}
+    with ProcessPoolExecutor(max_workers=viz_workers) as executor:
+        futures = {executor.submit(create_annotated_image_worker, task): task[0]
+                   for task in viz_tasks}
+
+        for future in tqdm(as_completed(futures), total=len(futures), desc="Creating visualizations"):
+            img_path = futures[future]
+            try:
+                viz_results[img_path] = future.result()
+            except Exception as e:
+                viz_results[img_path] = {'success': False, 'error': str(e)}
+
+    # Combine results
+    final_results = []
+    for result in score_results:
+        if result is None:
+            continue
+
+        img_path = result['path']
+        basename = os.path.basename(img_path)
+        output_path = os.path.join(output_dir, basename)
+
+        final_result = {
+            'path': img_path,
+            'filename': basename,
+            'score': result.get('score'),
+            'output_path': output_path
+        }
+
+        viz_result = viz_results.get(img_path, {})
+        if not viz_result.get('success', True):
+            final_result['viz_error'] = viz_result.get('error', 'Unknown error')
+
+        final_results.append(final_result)
+
+    return final_results
 
 
 def create_summary_visualization(
@@ -305,6 +536,16 @@ def main():
     parser.add_argument('--font-size', type=int, default=40,
                         help='Font size for score overlay')
 
+    # Batching args
+    parser.add_argument('--batched', action='store_true',
+                        help='Use GPU batching and CPU multiprocessing (faster)')
+    parser.add_argument('--batch-size', type=int, default=32,
+                        help='Batch size for GPU inference (default: 32)')
+    parser.add_argument('--num-workers', type=int, default=4,
+                        help='Workers for data loading (default: 4)')
+    parser.add_argument('--viz-workers', type=int, default=None,
+                        help='Workers for visualization creation (default: CPU count)')
+
     args = parser.parse_args()
 
     # Setup device
@@ -341,13 +582,28 @@ def main():
 
     # Score and create individual visualizations
     print(f"\nCreating annotated images in {args.output_dir}")
-    results = score_and_visualize_holdout(
-        model,
-        holdout_images,
-        args.output_dir,
-        input_size=input_size,
-        device=device
-    )
+
+    if args.batched:
+        print("Using GPU batching and CPU multiprocessing")
+        results = score_and_visualize_batched(
+            model,
+            holdout_images,
+            args.output_dir,
+            input_size=input_size,
+            device=device,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            viz_workers=args.viz_workers,
+            font_size=args.font_size
+        )
+    else:
+        results = score_and_visualize_holdout(
+            model,
+            holdout_images,
+            args.output_dir,
+            input_size=input_size,
+            device=device
+        )
 
     # Save results JSON
     results_json_path = os.path.join(args.output_dir, 'scores.json')
